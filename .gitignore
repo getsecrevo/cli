@@ -1,0 +1,11 @@
+bin/
+dist/
+*.test
+*.exe
+*.out
+*.log
+.coverprofile
+.env
+.env.*
+!.env.example
+
