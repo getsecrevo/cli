@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/getsecrevo/cli/internal/client"
@@ -21,6 +22,7 @@ type APIClient interface {
 	BootstrapWorkspace(context.Context, client.BootstrapWorkspaceRequest) (client.BootstrapWorkspaceResponse, error)
 	ListSecrets(context.Context, string) (client.SecretListResponse, error)
 	GetSecret(context.Context, string, string) (client.Secret, error)
+	RevealSecretValue(context.Context, string, string) (client.SecretValue, error)
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
 }
 
@@ -30,6 +32,14 @@ type Options struct {
 	ClientFactory func() (APIClient, error)
 	Out           io.Writer
 	Err           io.Writer
+	// Runner is the side-effecting subprocess executor used by `secrevo run`.
+	// Tests inject a fake; production wiring leaves it nil to use the
+	// os/exec-backed default.
+	Runner Runner
+	// Stdin is used as the child process stdin in `secrevo run`. Leaving
+	// it nil falls back to os.Stdin in production and io.Reader-based test
+	// fakes inject their own.
+	Stdin io.Reader
 }
 
 func Execute(args []string, out, errOut io.Writer) error {
@@ -218,29 +228,203 @@ func newAgentCommand(opts Options) *cobra.Command {
 }
 
 func newRunCommand(opts Options) *cobra.Command {
-	return &cobra.Command{
-		Use:   "run -- <command>",
-		Short: "Print the command invocation contract",
-		Args:  cobra.MinimumNArgs(1),
+	cmd := &cobra.Command{
+		Use:   "run [--secret name[=ENV_VAR]]... -- <command> [args...]",
+		Short: "Run a process with Secrevo secrets injected as environment variables",
+		Long: `Run a process with Secrevo secrets injected as environment variables.
+
+Each --secret flag names a secret to reveal from the workspace and inject
+into the child process. The default env var name is the secret name verbatim;
+pass --secret NAME=ENV_NAME to rename. Multiple --secret flags are allowed,
+and values are revealed in parallel before the child process starts.
+
+The child inherits stdin/stdout/stderr and the calling process's environment
+(plus the injected secrets). On exit, the CLI exits with the same status
+code as the child.
+
+Examples:
+
+  secrevo run --secret OPENAI_API_KEY -- python app.py
+  secrevo run --secret AWS_ACCESS_KEY_ID --secret AWS_SECRET_ACCESS_KEY -- aws s3 ls
+  secrevo run --secret prod-stripe=STRIPE_API_KEY -- npm test
+`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			api, err := getClient(opts)
-			if err != nil {
-				return err
-			}
 			workspaceID, err := workspaceID(cmd)
 			if err != nil {
 				return err
 			}
-			contract := map[string]any{
-				"workspace_id": workspaceID,
-				"command":      args,
-				"api_base_url": api.BaseURL(),
-				"status":       "contract-only",
-				"note":         "execution is not wired yet",
+			rawSpecs, _ := cmd.Flags().GetStringArray("secret")
+			specs, err := parseSecretSpecs(rawSpecs)
+			if err != nil {
+				return err
 			}
-			return writeJSON(opts.Out, contract)
+
+			api, err := getClient(opts)
+			if err != nil {
+				return err
+			}
+
+			env, err := buildInjectedEnv(cmd.Context(), api, workspaceID, specs)
+			if err != nil {
+				return err
+			}
+
+			runner := opts.Runner
+			if runner == nil {
+				runner = osExecRunner{}
+			}
+			stdin := opts.Stdin
+			if stdin == nil {
+				stdin = os.Stdin
+			}
+
+			return runner.Run(cmd.Context(), RunSpec{
+				Command: args[0],
+				Args:    args[1:],
+				Env:     env,
+				Stdin:   stdin,
+				Stdout:  opts.Out,
+				Stderr:  opts.Err,
+			})
 		},
 	}
+	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to inject (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
+	return cmd
+}
+
+// secretSpec is one --secret flag value: a secret name plus the env var
+// name to inject it under (defaulting to the secret name).
+type secretSpec struct {
+	secretName string
+	envName    string
+}
+
+func parseSecretSpecs(raw []string) ([]secretSpec, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("at least one --secret flag is required")
+	}
+	out := make([]secretSpec, 0, len(raw))
+	seen := make(map[string]string)
+	for _, entry := range raw {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, fmt.Errorf("--secret cannot be empty")
+		}
+		secretName, envName := entry, entry
+		if i := strings.Index(entry, "="); i >= 0 {
+			secretName = strings.TrimSpace(entry[:i])
+			envName = strings.TrimSpace(entry[i+1:])
+		}
+		if secretName == "" {
+			return nil, fmt.Errorf("--secret %q has empty secret name", entry)
+		}
+		if envName == "" {
+			return nil, fmt.Errorf("--secret %q has empty env var name", entry)
+		}
+		if previous, ok := seen[envName]; ok {
+			return nil, fmt.Errorf("env var %q would be set twice (from %q and %q)", envName, previous, secretName)
+		}
+		seen[envName] = secretName
+		out = append(out, secretSpec{secretName: secretName, envName: envName})
+	}
+	return out, nil
+}
+
+// buildInjectedEnv reveals each secret and returns the parent environment
+// extended with the injected variables. Reveal calls happen sequentially
+// because each one emits a separate audit event and the caller wants
+// deterministic ordering in the audit log.
+func buildInjectedEnv(ctx context.Context, api APIClient, workspaceID string, specs []secretSpec) ([]string, error) {
+	list, err := api.ListSecrets(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace secrets: %w", err)
+	}
+	available := make([]string, 0, len(list.Secrets))
+	for _, s := range list.Secrets {
+		available = append(available, s.Name)
+	}
+
+	env := os.Environ()
+	for _, spec := range specs {
+		secretID, err := resolveSecretID(list.Secrets, spec.secretName)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"secret %q not found in workspace %q. Available: %s",
+				spec.secretName, workspaceID, strings.Join(available, ", "),
+			)
+		}
+		revealed, err := api.RevealSecretValue(ctx, workspaceID, secretID)
+		if err != nil {
+			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
+		}
+		env = append(env, spec.envName+"="+revealed.Value)
+	}
+	return env, nil
+}
+
+// Runner abstracts subprocess execution so tests can record calls without
+// actually exec-ing anything.
+type Runner interface {
+	Run(ctx context.Context, spec RunSpec) error
+}
+
+// RunSpec is the data the Runner needs to spawn the child. Stdout and
+// Stderr are deliberately the same writers the cobra command was given so
+// tests can read what the child "wrote".
+type RunSpec struct {
+	Command string
+	Args    []string
+	Env     []string
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Stderr  io.Writer
+}
+
+type osExecRunner struct{}
+
+func (osExecRunner) Run(ctx context.Context, spec RunSpec) error {
+	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
+	cmd.Env = spec.Env
+	cmd.Stdin = spec.Stdin
+	cmd.Stdout = spec.Stdout
+	cmd.Stderr = spec.Stderr
+	if err := cmd.Run(); err != nil {
+		// Surface the child's exit code as the CLI's exit code.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return cliExitError{Code: exitErr.ExitCode()}
+		}
+		return fmt.Errorf("run %s: %w", spec.Command, err)
+	}
+	return nil
+}
+
+// cliExitError is recognized by the cobra Execute caller to translate the
+// child's exit code into the CLI's own exit code without printing the
+// underlying error twice.
+type cliExitError struct {
+	Code int
+}
+
+func (e cliExitError) Error() string {
+	return fmt.Sprintf("subprocess exited with code %d", e.Code)
+}
+
+// ExitCode reports the exit code carried by an error returned from
+// Execute, defaulting to 1 for non-cliExitError failures and 0 on
+// success. The main package converts this to os.Exit so the CLI
+// process's exit code matches what the user expects when running
+// `secrevo run -- <command>`.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr cliExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.Code
+	}
+	return 1
 }
 
 func withClient(opts Options, fn func(APIClient) error) error {
