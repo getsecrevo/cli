@@ -57,6 +57,36 @@ func TestWhoamiSendsBearerToken(t *testing.T) {
 	}
 }
 
+func TestRevealSecretValueHitsValueEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/v1/workspaces/ws-1/secrets/sec-1/value" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(SecretValue{
+			WorkspaceID: "ws-1",
+			SecretID:    "sec-1",
+			Value:       "sk-live-123",
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(Config{BaseURL: server.URL, Token: "t", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	got, err := c.RevealSecretValue(context.Background(), "ws-1", "sec-1")
+	if err != nil {
+		t.Fatalf("RevealSecretValue() error = %v", err)
+	}
+	if got.Value != "sk-live-123" {
+		t.Fatalf("value = %q, want sk-live-123", got.Value)
+	}
+}
+
 func TestBootstrapWorkspaceSendsRequestBody(t *testing.T) {
 	t.Helper()
 

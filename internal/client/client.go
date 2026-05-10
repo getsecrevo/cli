@@ -67,6 +67,12 @@ type SecretListResponse struct {
 	Secrets []Secret `json:"secrets"`
 }
 
+type SecretValue struct {
+	WorkspaceID string `json:"workspace_id"`
+	SecretID    string `json:"secret_id"`
+	Value       string `json:"value"`
+}
+
 type Agent struct {
 	ID              string `json:"id"`
 	WorkspaceID     string `json:"workspace_id"`
@@ -144,6 +150,13 @@ func (c *Client) BootstrapWorkspace(ctx context.Context, req BootstrapWorkspaceR
 func (c *Client) GetSecret(ctx context.Context, workspaceID, secretID string) (Secret, error) {
 	var out Secret
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+func (c *Client) RevealSecretValue(ctx context.Context, workspaceID, secretID string) (SecretValue, error) {
+	var out SecretValue
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/value", url.PathEscape(workspaceID), url.PathEscape(secretID))
 	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
 	return out, err
 }

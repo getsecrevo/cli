@@ -59,8 +59,20 @@ The API client uses:
 - `SECREVO_API_TOKEN`
 - `SECREVO_WORKSPACE_ID` or `--workspace-id` for workspace-scoped commands
 
-The current `run` command is contract-first: it prints the invocation contract
-and does not yet execute the target command.
+`secrevo run` is the flagship execution command. It reveals one or more
+secrets from the workspace and injects them into the environment of a
+subprocess, so applications can keep secrets out of `.env` files, shell
+history, and disk in general:
+
+```bash
+secrevo run --secret OPENAI_API_KEY -- python app.py
+secrevo run --secret AWS_ACCESS_KEY_ID --secret AWS_SECRET_ACCESS_KEY -- aws s3 ls
+secrevo run --secret prod-stripe=STRIPE_API_KEY -- npm test
+```
+
+The default env var name matches the secret name; pass `--secret name=ENV`
+to rename. The CLI exits with the same status code as the child process,
+so `secrevo run -- false` exits 1, `... -- true` exits 0.
 
 ## Local development
 
