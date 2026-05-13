@@ -40,6 +40,7 @@ func TestFlattenYAMLBuildsDottedNames(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{
+		`list_value=["one","two"]`,
 		"flat=top-level",
 		"numbers.enabled=true",
 		"numbers.port=5432",
@@ -48,11 +49,62 @@ func TestFlattenYAMLBuildsDottedNames(t *testing.T) {
 		"webhooks.primary.name=primary-alarms",
 		"webhooks.primary.url=https://hook.us2.make.com/abc",
 	}
+	sort.Strings(want)
 	if !equalStringSlices(got, want) {
 		t.Fatalf("flatten output = %v, want %v", got, want)
 	}
-	if len(skipped) != 1 || skipped[0] != "list_value" {
-		t.Fatalf("skipped = %v, want [list_value]", skipped)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want empty (scalar sequence is now serialized as JSON)", skipped)
+	}
+}
+
+func TestFlattenYAMLSerializesScalarListAsJSON(t *testing.T) {
+	yamlSrc := `app:
+  redirect_uris:
+    - https://a.example.com/cb
+    - https://b.example.com/cb
+`
+	leaves, skipped, err := ensureImportNotEmpty([]byte(yamlSrc), "", ".")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want empty", skipped)
+	}
+	if len(leaves) != 1 {
+		t.Fatalf("expected 1 leaf, got %d", len(leaves))
+	}
+	got := leaves[0]
+	if got.name != "app.redirect_uris" {
+		t.Fatalf("name = %q", got.name)
+	}
+	if got.value != `["https://a.example.com/cb","https://b.example.com/cb"]` {
+		t.Fatalf("value = %q", got.value)
+	}
+	if got.description == "" {
+		t.Fatalf("description should be auto-populated for serialized lists; got empty")
+	}
+}
+
+func TestFlattenYAMLSkipsNestedSequence(t *testing.T) {
+	// A sequence whose children are not all scalars (here: a list of
+	// maps) should remain in "skipped" — we won't guess a serialization
+	// for arbitrary structures.
+	yamlSrc := `nested:
+  - name: a
+    value: 1
+  - name: b
+    value: 2
+`
+	leaves, skipped, err := ensureImportNotEmpty([]byte(yamlSrc), "", ".")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(leaves) != 0 {
+		t.Fatalf("expected 0 leaves, got %+v", leaves)
+	}
+	if len(skipped) != 1 || skipped[0] != "nested" {
+		t.Fatalf("skipped = %v, want [nested]", skipped)
 	}
 }
 
