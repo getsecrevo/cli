@@ -18,7 +18,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const defaultVersion = "0.1.0-dev"
+// defaultVersion is overridden at build time via
+// `-ldflags '-X github.com/getsecrevo/cli/internal/app.defaultVersion=v0.X.Y'`
+// from the release workflow (goreleaser). Local `go build` keeps the
+// `-dev` suffix.
+var defaultVersion = "0.1.0-dev"
 
 type APIClient interface {
 	BaseURL() string

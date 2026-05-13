@@ -1,0 +1,72 @@
+# goreleaser v2 config. Tag-driven releases: `git tag vX.Y.Z && git push --tags`
+# triggers `.github/workflows/release.yml` which runs `goreleaser release`.
+version: 2
+
+project_name: secrevo
+
+builds:
+  - id: secrevo
+    main: ./cmd/secrevo
+    binary: secrevo
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/getsecrevo/cli/internal/app.defaultVersion={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: secrevo
+    builds:
+      - secrevo
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macos
+      {{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+snapshot:
+  version_template: '{{ .Version }}-snapshot-{{ .ShortCommit }}'
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+
+release:
+  github:
+    owner: getsecrevo
+    name: cli
+  draft: false
+  prerelease: auto
+  name_template: '{{.Tag}}'
+  # Attach the install scripts so the one-liners
+  #   curl -fsSL https://github.com/getsecrevo/cli/releases/latest/download/install.sh | bash
+  #   irm https://github.com/getsecrevo/cli/releases/latest/download/install.ps1 | iex
+  # work directly off the GitHub release, without a separate hosting hop.
+  extra_files:
+    - glob: scripts/install.sh
+    - glob: scripts/install.ps1
