@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/getsecrevo/cli/internal/client"
+	"github.com/getsecrevo/cli/internal/credentials"
 	"github.com/spf13/cobra"
 )
 
@@ -42,12 +43,33 @@ type Options struct {
 	// it nil falls back to os.Stdin in production and io.Reader-based test
 	// fakes inject their own.
 	Stdin io.Reader
+	// Browser opens a URL during `secrevo login`. Tests inject a no-op
+	// fake; production uses the OS default browser.
+	Browser BrowserOpener
+	// LoginVerifier validates a captured agent token before persisting it.
+	// Tests inject a func that returns nil; production posts to
+	// /v1/auth/sessions.
+	LoginVerifier func(ctx context.Context, baseURL, token string) error
+	// CredentialsPath overrides the on-disk credentials file location.
+	// Tests inject a temp path; production uses credentials.DefaultPath().
+	CredentialsPath string
 }
 
 func Execute(args []string, out, errOut io.Writer) error {
+	workspaceID := strings.TrimSpace(os.Getenv("SECREVO_WORKSPACE_ID"))
+	if workspaceID == "" {
+		// Fall back to the workspace recorded by `secrevo login` so
+		// commands that need --workspace-id don't error out when the
+		// operator authenticated via the CLI.
+		if path, err := credentials.DefaultPath(); err == nil {
+			if stored, err := credentials.Load(path); err == nil {
+				workspaceID = strings.TrimSpace(stored.WorkspaceID)
+			}
+		}
+	}
 	opts := Options{
 		Version:     defaultVersion,
-		WorkspaceID: strings.TrimSpace(os.Getenv("SECREVO_WORKSPACE_ID")),
+		WorkspaceID: workspaceID,
 		Out:         out,
 		Err:         errOut,
 		ClientFactory: func() (APIClient, error) {
@@ -98,6 +120,8 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))
 	root.AddCommand(newExportCommand(opts))
+	root.AddCommand(newLoginCommand(opts))
+	root.AddCommand(newLogoutCommand(opts))
 
 	return root
 }
