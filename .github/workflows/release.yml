@@ -1,0 +1,51 @@
+# Tag-driven release workflow. Build matrix is handled inside goreleaser so
+# everything fits in a single Linux runner (cheaper on free-plan minutes —
+# see ci_quota_awareness memory).
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'When true, run goreleaser with --snapshot --skip=publish so the artefacts stay on the runner.'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write   # required to create GitHub releases + upload archives
+
+concurrency:
+  group: cli-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # goreleaser needs the full history for changelog generation.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: >-
+            release
+            ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true'
+              && '--snapshot --skip=publish --clean'
+              || '--clean' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
