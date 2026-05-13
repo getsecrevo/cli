@@ -336,6 +336,105 @@ func TestParseSecretSpecsRejectsCollidingEnvNames(t *testing.T) {
 	}
 }
 
+func TestRunAllInjectsEveryVisibleSecret(t *testing.T) {
+	var out bytes.Buffer
+	runner := &recordingRunner{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return fakeAPIClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--all", "--", "python", "agent.py"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, ok := envValue(runner.spec.Env, "DB_PASSWORD"); !ok || got != "db-password-value" {
+		t.Fatalf("DB_PASSWORD = %q ok=%v, want db-password-value (sanitized from db-password)", got, ok)
+	}
+	if got, ok := envValue(runner.spec.Env, "OPENAI_API_KEY"); !ok || got != "sk-live-openai" {
+		t.Fatalf("OPENAI_API_KEY = %q ok=%v, want sk-live-openai", got, ok)
+	}
+}
+
+func TestRunAllRejectsCombinedWithSecret(t *testing.T) {
+	runner := &recordingRunner{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &bytes.Buffer{},
+		Err:         &bytes.Buffer{},
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return fakeAPIClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--all", "--secret", "OPENAI_API_KEY", "--", "echo"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--all cannot be combined with --secret") {
+		t.Fatalf("Execute() error = %v, want combined-flag rejection", err)
+	}
+	if runner.spec.Command != "" {
+		t.Fatalf("runner should not have been invoked")
+	}
+}
+
+func TestRunInjectsContextVarsForChild(t *testing.T) {
+	runner := &recordingRunner{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &bytes.Buffer{},
+		Err:         &bytes.Buffer{},
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return fakeAPIClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--secret", "OPENAI_API_KEY", "--", "echo"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got, ok := envValue(runner.spec.Env, "SECREVO_RUN"); !ok || got != "1" {
+		t.Fatalf("SECREVO_RUN = %q ok=%v, want 1", got, ok)
+	}
+	if got, ok := envValue(runner.spec.Env, "SECREVO_WORKSPACE_ID"); !ok || got != "workspace-1" {
+		t.Fatalf("SECREVO_WORKSPACE_ID = %q ok=%v, want workspace-1", got, ok)
+	}
+}
+
+func TestAllSecretSpecsRejectsSanitizeCollisions(t *testing.T) {
+	// Two distinct secret names that collide on the POSIX form must fail
+	// loud so the operator either renames one or falls back to explicit
+	// --secret specs.
+	secrets := []client.Secret{
+		{Name: "aws.cloudwatch.url"},
+		{Name: "aws_cloudwatch_url"},
+	}
+	_, err := allSecretSpecs(secrets, true)
+	if err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("allSecretSpecs() error = %v, want collision error", err)
+	}
+}
+
+func TestAllSecretSpecsRawNamePreservesLiteral(t *testing.T) {
+	secrets := []client.Secret{
+		{Name: "aws.cloudwatch.url"},
+		{Name: "OPENAI_API_KEY"},
+	}
+	specs, err := allSecretSpecs(secrets, false)
+	if err != nil {
+		t.Fatalf("allSecretSpecs() error = %v", err)
+	}
+	if specs[0].envName != "aws.cloudwatch.url" || specs[1].envName != "OPENAI_API_KEY" {
+		t.Fatalf("raw-mode envNames = %+v, want literal", specs)
+	}
+}
+
 func TestParseSecretSpecsSanitizesByDefault(t *testing.T) {
 	specs, err := parseSecretSpecs([]string{"aws.cloudwatch.url", "OPENAI_API_KEY"}, true)
 	if err != nil {
