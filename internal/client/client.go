@@ -92,6 +92,17 @@ type AgentCreateRequest struct {
 	Description string `json:"description,omitempty"`
 }
 
+type SecretCreateRequest struct {
+	Name                     string `json:"name"`
+	Description              string `json:"description,omitempty"`
+	RegenerationInstructions string `json:"regeneration_instructions,omitempty"`
+	Value                    string `json:"value,omitempty"`
+}
+
+type SecretValueWriteRequest struct {
+	Value string `json:"value"`
+}
+
 type AgentCreateResponse struct {
 	Agent   Agent  `json:"agent"`
 	Token   string `json:"token"`
@@ -166,6 +177,25 @@ func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretLis
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets", url.PathEscape(workspaceID))
 	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
 	return out, err
+}
+
+// CreateSecret creates a new secret in the workspace and, when ``req.Value``
+// is non-empty, writes the value to OpenBao in a single API round-trip.
+// The returned ``Secret`` carries the metadata only — the value is never
+// echoed back.
+func (c *Client) CreateSecret(ctx context.Context, workspaceID string, req SecretCreateRequest) (Secret, error) {
+	var out Secret
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets", url.PathEscape(workspaceID))
+	err := c.doJSON(ctx, http.MethodPost, path, req, &out)
+	return out, err
+}
+
+// RotateSecretValue overwrites the value of an existing secret without
+// touching metadata. The previous value is unrecoverable from the API
+// (the workspace's audit log records the rotation event).
+func (c *Client) RotateSecretValue(ctx context.Context, workspaceID, secretID, value string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/value", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	return c.doJSON(ctx, http.MethodPut, path, SecretValueWriteRequest{Value: value}, nil)
 }
 
 func (c *Client) CreateAgent(ctx context.Context, workspaceID string, req AgentCreateRequest) (AgentCreateResponse, error) {

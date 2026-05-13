@@ -43,6 +43,68 @@ func (f fakeAPIClient) RevealSecretValue(_ context.Context, _ string, secretID s
 func (f fakeAPIClient) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
 	return client.AgentCreateResponse{Token: "token-1", Snippet: "export SECREVO_AGENT_TOKEN=token-1"}, nil
 }
+func (f fakeAPIClient) CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error) {
+	return client.Secret{}, errors.New("fakeAPIClient does not support CreateSecret; use secretWritingFake")
+}
+func (f fakeAPIClient) RotateSecretValue(context.Context, string, string, string) error {
+	return errors.New("fakeAPIClient does not support RotateSecretValue; use secretWritingFake")
+}
+
+// secretWritingFake captures create/rotate calls so the secret-set/update
+// tests can assert exactly which path was taken. The list of pre-existing
+// secrets is the fixture; everything else accumulates in the call log.
+type secretWritingFake struct {
+	existing      []client.Secret
+	createCalls   []client.SecretCreateRequest
+	rotateCalls   []rotateCall
+	rotateErr     error
+	createErr     error
+}
+
+type rotateCall struct {
+	secretID string
+	value    string
+}
+
+func (f *secretWritingFake) BaseURL() string                                { return "" }
+func (f *secretWritingFake) Whoami(context.Context) (client.Session, error) { return client.Session{}, nil }
+func (f *secretWritingFake) BootstrapWorkspace(context.Context, client.BootstrapWorkspaceRequest) (client.BootstrapWorkspaceResponse, error) {
+	return client.BootstrapWorkspaceResponse{}, nil
+}
+func (f *secretWritingFake) ListSecrets(context.Context, string) (client.SecretListResponse, error) {
+	return client.SecretListResponse{Secrets: append([]client.Secret(nil), f.existing...)}, nil
+}
+func (f *secretWritingFake) GetSecret(context.Context, string, string) (client.Secret, error) {
+	return client.Secret{}, errors.New("not implemented")
+}
+func (f *secretWritingFake) RevealSecretValue(context.Context, string, string) (client.SecretValue, error) {
+	return client.SecretValue{}, errors.New("not implemented")
+}
+func (f *secretWritingFake) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
+	return client.AgentCreateResponse{}, nil
+}
+func (f *secretWritingFake) CreateSecret(_ context.Context, _ string, req client.SecretCreateRequest) (client.Secret, error) {
+	if f.createErr != nil {
+		return client.Secret{}, f.createErr
+	}
+	f.createCalls = append(f.createCalls, req)
+	created := client.Secret{
+		WorkspaceID: "workspace-1",
+		SecretID:    "secret-new",
+		Name:        req.Name,
+		Description: req.Description,
+		Status:      "active",
+	}
+	f.existing = append(f.existing, created)
+	return created, nil
+}
+func (f *secretWritingFake) RotateSecretValue(_ context.Context, _ string, secretID string, value string) error {
+	if f.rotateErr != nil {
+		return f.rotateErr
+	}
+	f.rotateCalls = append(f.rotateCalls, rotateCall{secretID: secretID, value: value})
+	return nil
+}
 
 func TestCommandParsing(t *testing.T) {
 	cases := []struct {
@@ -264,6 +326,168 @@ func TestWhoamiUsesFakeClient(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "alice@example.com") {
 		t.Fatalf("output = %q, want session JSON", out.String())
+	}
+}
+
+func TestSecretSetCreatesWhenAbsent(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{
+		"secret", "set", "NEW_KEY",
+		"--value", "sk-live-xyz",
+		"--description", "Stripe live key",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.createCalls) != 1 {
+		t.Fatalf("createCalls = %d, want 1", len(fake.createCalls))
+	}
+	if got := fake.createCalls[0]; got.Name != "NEW_KEY" || got.Value != "sk-live-xyz" || got.Description != "Stripe live key" {
+		t.Fatalf("create payload = %+v", got)
+	}
+	if len(fake.rotateCalls) != 0 {
+		t.Fatalf("rotateCalls = %d, want 0", len(fake.rotateCalls))
+	}
+	if !strings.Contains(out.String(), "Created secret \"NEW_KEY\"") {
+		t.Fatalf("output = %q, want creation confirmation", out.String())
+	}
+}
+
+func TestSecretSetRotatesWhenExists(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-1", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "OPENAI_API_KEY", "--value", "sk-live-new"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.createCalls) != 0 {
+		t.Fatalf("createCalls = %d, want 0", len(fake.createCalls))
+	}
+	if len(fake.rotateCalls) != 1 {
+		t.Fatalf("rotateCalls = %d, want 1", len(fake.rotateCalls))
+	}
+	if got := fake.rotateCalls[0]; got.secretID != "secret-1" || got.value != "sk-live-new" {
+		t.Fatalf("rotate call = %+v", got)
+	}
+}
+
+func TestSecretSetUpdateOnlyRefusesToCreate(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "MISSING", "--value", "x", "--update-only"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("Execute() error = %v, want not-found", err)
+	}
+	if len(fake.createCalls)+len(fake.rotateCalls) != 0 {
+		t.Fatalf("no API calls expected; got createCalls=%d rotateCalls=%d", len(fake.createCalls), len(fake.rotateCalls))
+	}
+}
+
+func TestSecretSetCreateOnlyRefusesToRotate(t *testing.T) {
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-1", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "OPENAI_API_KEY", "--value", "x", "--create-only"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("Execute() error = %v, want already-exists", err)
+	}
+}
+
+func TestSecretSetRequiresValueSource(t *testing.T) {
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "NEW_KEY"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "exactly one of --value") {
+		t.Fatalf("Execute() error = %v, want missing-source error", err)
+	}
+}
+
+func TestSecretSetFromStdin(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		Stdin:         strings.NewReader("from-stdin-value\n"),
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "STDIN_KEY", "--from-stdin"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.createCalls) != 1 {
+		t.Fatalf("createCalls = %d, want 1", len(fake.createCalls))
+	}
+	if got := fake.createCalls[0].Value; got != "from-stdin-value" {
+		t.Fatalf("stdin value = %q, want trimmed", got)
+	}
+}
+
+func TestSecretUpdateAliasesUpdateOnly(t *testing.T) {
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-1", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "update", "OPENAI_API_KEY", "--value", "sk-rotated"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.rotateCalls) != 1 || fake.rotateCalls[0].value != "sk-rotated" {
+		t.Fatalf("rotateCalls = %+v", fake.rotateCalls)
 	}
 }
 

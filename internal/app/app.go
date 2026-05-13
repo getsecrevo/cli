@@ -23,6 +23,8 @@ type APIClient interface {
 	ListSecrets(context.Context, string) (client.SecretListResponse, error)
 	GetSecret(context.Context, string, string) (client.Secret, error)
 	RevealSecretValue(context.Context, string, string) (client.SecretValue, error)
+	CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error)
+	RotateSecretValue(context.Context, string, string, string) error
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
 }
 
@@ -192,7 +194,194 @@ func newSecretCommand(opts Options) *cobra.Command {
 			})
 		},
 	})
+	secret.AddCommand(newSecretSetCommand(opts))
+	secret.AddCommand(newSecretUpdateCommand(opts))
 	return secret
+}
+
+func newSecretSetCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set <secret-name>",
+		Short: "Create or rotate a secret's value",
+		Long: `Create a new secret or rotate the value of an existing one.
+
+If the secret name does not exist in the workspace, it is created with
+the supplied value (and optional --description). If it already exists,
+its value is rotated; metadata is left untouched.
+
+Use --update-only to refuse creating a new secret (useful in rotation
+scripts that should fail loud if the secret was deleted). Use
+--create-only to refuse rotating an existing one.
+
+The value source must be exactly one of:
+  --value "literal"
+  --from-file PATH    (reads the file as the value, preserving newlines)
+  --from-stdin        (reads stdin until EOF)
+
+Examples:
+
+  secrevo secret set OPENAI_API_KEY --value "sk-live-..."
+  secrevo secret set CLOUDFLARE_TOKEN --from-file ~/.devvault/cf.txt
+  cat secret.key | secrevo secret set RSA_PRIVATE --from-stdin
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretSet(cmd, opts, args[0], false)
+		},
+	}
+	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
+	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
+	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
+	cmd.Flags().String("description", "", "Optional description (used only when creating)")
+	cmd.Flags().String("regeneration-instructions", "", "Optional notes on how to rotate this secret (used only when creating)")
+	cmd.Flags().Bool("update-only", false, "Refuse to create the secret if it does not exist")
+	cmd.Flags().Bool("create-only", false, "Refuse to rotate the secret if it already exists")
+	return cmd
+}
+
+func newSecretUpdateCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "update <secret-name>",
+		Short: "Rotate an existing secret's value (alias of `set --update-only`)",
+		Long: `Rotate the value of an existing secret. Fails if the secret does
+not exist — for create-or-rotate semantics use ` + "`secrevo secret set`" + `.
+
+Examples:
+
+  secrevo secret update OPENAI_API_KEY --value "sk-live-..."
+  pbpaste | secrevo secret update OPENAI_API_KEY --from-stdin
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretSet(cmd, opts, args[0], true)
+		},
+	}
+	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
+	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
+	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
+	return cmd
+}
+
+func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly bool) error {
+	workspaceID, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+
+	value, err := readSecretValue(cmd, opts)
+	if err != nil {
+		return err
+	}
+
+	updateOnly := forceUpdateOnly
+	if !forceUpdateOnly {
+		updateOnly, _ = cmd.Flags().GetBool("update-only")
+	}
+	createOnly, _ := cmd.Flags().GetBool("create-only")
+	if updateOnly && createOnly {
+		return fmt.Errorf("--update-only and --create-only are mutually exclusive")
+	}
+	description, _ := cmd.Flags().GetString("description")
+	regeneration, _ := cmd.Flags().GetString("regeneration-instructions")
+
+	return withClient(opts, func(api APIClient) error {
+		list, err := api.ListSecrets(cmd.Context(), workspaceID)
+		if err != nil {
+			return fmt.Errorf("list secrets: %w", err)
+		}
+
+		existing := findSecretByName(list.Secrets, name)
+		if existing != nil {
+			if createOnly {
+				return fmt.Errorf("secret %q already exists in workspace %q", name, workspaceID)
+			}
+			if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, value); err != nil {
+				return fmt.Errorf("rotate secret value: %w", err)
+			}
+			_, _ = fmt.Fprintf(opts.Out, "Rotated secret %q (%s) in workspace %s\n", name, existing.SecretID, workspaceID)
+			return nil
+		}
+
+		if updateOnly {
+			available := secretNames(list.Secrets)
+			return fmt.Errorf(
+				"secret %q not found in workspace %q. Available: %s",
+				name, workspaceID, strings.Join(available, ", "),
+			)
+		}
+
+		created, err := api.CreateSecret(cmd.Context(), workspaceID, client.SecretCreateRequest{
+			Name:                     name,
+			Description:              description,
+			RegenerationInstructions: regeneration,
+			Value:                    value,
+		})
+		if err != nil {
+			return fmt.Errorf("create secret: %w", err)
+		}
+		_, _ = fmt.Fprintf(opts.Out, "Created secret %q (%s) in workspace %s\n", created.Name, created.SecretID, workspaceID)
+		return nil
+	})
+}
+
+func readSecretValue(cmd *cobra.Command, opts Options) (string, error) {
+	literal, _ := cmd.Flags().GetString("value")
+	path, _ := cmd.Flags().GetString("from-file")
+	fromStdin, _ := cmd.Flags().GetBool("from-stdin")
+
+	provided := 0
+	if literal != "" {
+		provided++
+	}
+	if path != "" {
+		provided++
+	}
+	if fromStdin {
+		provided++
+	}
+	if provided == 0 {
+		return "", fmt.Errorf("provide exactly one of --value, --from-file, or --from-stdin")
+	}
+	if provided > 1 {
+		return "", fmt.Errorf("--value, --from-file, and --from-stdin are mutually exclusive")
+	}
+
+	if literal != "" {
+		return literal, nil
+	}
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read %s: %w", path, err)
+		}
+		return string(data), nil
+	}
+	stdin := opts.Stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", fmt.Errorf("read stdin: %w", err)
+	}
+	return strings.TrimRight(string(data), "\r\n"), nil
+}
+
+func findSecretByName(secrets []client.Secret, name string) *client.Secret {
+	for i := range secrets {
+		if secrets[i].Name == name {
+			return &secrets[i]
+		}
+	}
+	return nil
+}
+
+func secretNames(secrets []client.Secret) []string {
+	out := make([]string, 0, len(secrets))
+	for _, s := range secrets {
+		out = append(out, s.Name)
+	}
+	return out
 }
 
 func newAgentCommand(opts Options) *cobra.Command {
