@@ -8,8 +8,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/getsecrevo/cli/internal/client"
 	"github.com/getsecrevo/cli/internal/credentials"
@@ -557,12 +559,18 @@ AWS_CLOUDWATCH_WEBHOOKS_URL. Pass --secret NAME=ENV_NAME to rename
 explicitly, or --raw-name to inject under the secret's literal name (only
 useful when the operator knows their shell handles the non-POSIX form).
 
-Multiple --secret flags are allowed, and values are revealed sequentially
-before the child process starts.
+--all injects every secret visible to the current token (one reveal per
+secret, sanitized env var name) and cannot be combined with --secret.
 
 The child inherits stdin/stdout/stderr and the calling process's environment
-(plus the injected secrets). On exit, the CLI exits with the same status
+(plus the injected secrets). SIGINT/SIGTERM received by the CLI are
+forwarded to the child so wrappers like ` + "`docker run`" + ` and ` + "`kubectl`" + ` get
+their normal cleanup window. On exit, the CLI exits with the same status
 code as the child.
+
+Two extra variables are injected so the child can detect it is running
+under ` + "`secrevo run`" + ` and which workspace it was launched against:
+SECREVO_RUN=1, SECREVO_WORKSPACE_ID=<id>.
 
 Examples:
 
@@ -570,6 +578,7 @@ Examples:
   secrevo run --secret AWS_ACCESS_KEY_ID --secret AWS_SECRET_ACCESS_KEY -- aws s3 ls
   secrevo run --secret prod-stripe=STRIPE_API_KEY -- npm test
   secrevo run --secret aws.cloudwatch.webhooks.url --raw-name -- legacy-script
+  secrevo run --all -- python agent.py
 `,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -579,9 +588,9 @@ Examples:
 			}
 			rawSpecs, _ := cmd.Flags().GetStringArray("secret")
 			rawName, _ := cmd.Flags().GetBool("raw-name")
-			specs, err := parseSecretSpecs(rawSpecs, !rawName)
-			if err != nil {
-				return err
+			injectAll, _ := cmd.Flags().GetBool("all")
+			if injectAll && len(rawSpecs) > 0 {
+				return fmt.Errorf("--all cannot be combined with --secret; --all already injects every visible secret")
 			}
 
 			api, err := getClient(opts)
@@ -589,7 +598,25 @@ Examples:
 				return err
 			}
 
-			env, err := buildInjectedEnv(cmd.Context(), api, workspaceID, specs)
+			list, err := api.ListSecrets(cmd.Context(), workspaceID)
+			if err != nil {
+				return fmt.Errorf("list workspace secrets: %w", err)
+			}
+
+			var specs []secretSpec
+			if injectAll {
+				specs, err = allSecretSpecs(list.Secrets, !rawName)
+				if err != nil {
+					return err
+				}
+			} else {
+				specs, err = parseSecretSpecs(rawSpecs, !rawName)
+				if err != nil {
+					return err
+				}
+			}
+
+			env, err := buildInjectedEnv(cmd.Context(), api, workspaceID, list, specs)
 			if err != nil {
 				return err
 			}
@@ -615,7 +642,32 @@ Examples:
 	}
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to inject (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
 	cmd.Flags().Bool("raw-name", false, "Inject under the secret's literal name (skip POSIX sanitization)")
+	cmd.Flags().Bool("all", false, "Inject every secret visible to the current token (mutually exclusive with --secret)")
 	return cmd
+}
+
+// allSecretSpecs builds one spec per visible secret. When sanitize is true
+// the env var name is the POSIX form of the secret name; otherwise the
+// literal name is used. Conflicts after sanitization fail loud so the
+// operator notices instead of silently overwriting an env var.
+func allSecretSpecs(secrets []client.Secret, sanitize bool) ([]secretSpec, error) {
+	specs := make([]secretSpec, 0, len(secrets))
+	seen := make(map[string]string, len(secrets))
+	for _, s := range secrets {
+		envName := s.Name
+		if sanitize {
+			envName = sanitizeEnvName(s.Name)
+		}
+		if envName == "" {
+			return nil, fmt.Errorf("secret %q sanitizes to empty env var name", s.Name)
+		}
+		if previous, ok := seen[envName]; ok {
+			return nil, fmt.Errorf("--all would set env var %q twice (from secrets %q and %q); rename one of them or pass explicit --secret flags", envName, previous, s.Name)
+		}
+		seen[envName] = s.Name
+		specs = append(specs, secretSpec{secretName: s.Name, envName: envName})
+	}
+	return specs, nil
 }
 
 // secretSpec is one --secret flag value: a secret name plus the env var
@@ -680,17 +732,22 @@ func parseSecretSpecs(raw []string, sanitizeDefault bool) ([]secretSpec, error) 
 // extended with the injected variables. Reveal calls happen sequentially
 // because each one emits a separate audit event and the caller wants
 // deterministic ordering in the audit log.
-func buildInjectedEnv(ctx context.Context, api APIClient, workspaceID string, specs []secretSpec) ([]string, error) {
-	list, err := api.ListSecrets(ctx, workspaceID)
-	if err != nil {
-		return nil, fmt.Errorf("list workspace secrets: %w", err)
-	}
+//
+// Two context variables are always appended so the child can detect it
+// runs under `secrevo run` and which workspace was used:
+// SECREVO_RUN=1 and SECREVO_WORKSPACE_ID=<id>. They never carry the
+// agent token — if the child needs to call the API it must inherit
+// SECREVO_API_TOKEN from the parent environment explicitly.
+func buildInjectedEnv(ctx context.Context, api APIClient, workspaceID string, list client.SecretListResponse, specs []secretSpec) ([]string, error) {
 	available := make([]string, 0, len(list.Secrets))
 	for _, s := range list.Secrets {
 		available = append(available, s.Name)
 	}
 
 	env := os.Environ()
+	env = append(env, "SECREVO_RUN=1")
+	env = append(env, "SECREVO_WORKSPACE_ID="+workspaceID)
+
 	for _, spec := range specs {
 		secretID, err := resolveSecretID(list.Secrets, spec.secretName)
 		if err != nil {
@@ -728,14 +785,34 @@ type RunSpec struct {
 
 type osExecRunner struct{}
 
+// Run starts the child process and forwards SIGINT/SIGTERM/SIGHUP from
+// the CLI process to the child so wrappers like `docker run`, `kubectl
+// port-forward`, or `terraform apply` get their normal cleanup window
+// when the operator hits Ctrl-C. Using exec.CommandContext's default
+// Cancel would SIGKILL the child instead, which strands containers and
+// half-applied state.
 func (osExecRunner) Run(ctx context.Context, spec RunSpec) error {
-	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
+	cmd := exec.Command(spec.Command, spec.Args...)
 	cmd.Env = spec.Env
 	cmd.Stdin = spec.Stdin
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
-	if err := cmd.Run(); err != nil {
-		// Surface the child's exit code as the CLI's exit code.
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("run %s: %w", spec.Command, err)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+
+	done := make(chan struct{})
+	go forwardSignals(cmd.Process, ctx, sigCh, done)
+
+	err := cmd.Wait()
+	close(done)
+
+	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return cliExitError{Code: exitErr.ExitCode()}
@@ -743,6 +820,24 @@ func (osExecRunner) Run(ctx context.Context, spec RunSpec) error {
 		return fmt.Errorf("run %s: %w", spec.Command, err)
 	}
 	return nil
+}
+
+// forwardSignals relays OS signals received by the CLI to the child
+// process and exits when the child has been waited on (done closed) or
+// the caller cancels the context. Errors from Process.Signal are
+// intentionally swallowed: by the time a signal arrives the child may
+// already have exited and the next select iteration handles it.
+func forwardSignals(proc *os.Process, ctx context.Context, sigCh <-chan os.Signal, done <-chan struct{}) {
+	for {
+		select {
+		case sig := <-sigCh:
+			_ = proc.Signal(sig)
+		case <-ctx.Done():
+			_ = proc.Signal(os.Interrupt)
+		case <-done:
+			return
+		}
+	}
 }
 
 // cliExitError is recognized by the cobra Execute caller to translate the
