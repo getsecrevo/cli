@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -190,39 +192,61 @@ func powershellSingleQuote(value string) string {
 
 func newExportCommand(opts Options) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "export --out <file>",
-		Short: "Dump every visible secret + value to a local file (PLAINTEXT)",
-		Long: `Reveal every secret visible to the current agent token and write
-the resulting name → value map to a local JSON file.
+		Use:   "export [--kit --out-dir DIR] | [--plaintext --out PATH]",
+		Short: "Recovery snapshot of every visible secret (encrypted kit by default)",
+		Long: `Reveal every secret visible to the current agent token and write a
+local recovery snapshot.
 
-PLAINTEXT WARNING. This command writes secret values in cleartext to
-the destination path. Use it only when you control the destination
-disk and intend to wrap the output with your own encryption tool
-(` + "`gpg --symmetric backup.json`" + `, ` + "`age -p backup.json > backup.json.age`" + `,
-` + "`openssl enc`" + `, etc.). The CLI rejects writing to stdout to make
-the audit trail obvious.
+Two modes:
 
-Use case: a recovery backup before Fernando dogfoods Secrevo for a
-week. If Secrevo goes down, the operator restores from this file via
-` + "`secrevo import --plaintext-restore`" + ` (planned).
+  --kit (default)        Recovery Kit (Postura A — D-11.6). Writes TWO files
+                         in --out-dir (default: current directory):
+                           secrevo-backup-YYYY-MM-DD.json.kit  ← ciphertext
+                           secrevo-backup-YYYY-MM-DD.passphrase ← single-use
+                                                                   passphrase
+                         Format: PBKDF2-HMAC-SHA256 (200K iters) + AES-256-GCM.
+                         The dashboard (browser, WebCrypto) and the CLI (this
+                         command) produce identical formats, so a kit from
+                         either tool decrypts in either tool.
+                         IMMEDIATE NEXT STEP printed to stdout: copy the
+                         passphrase to a password manager and DELETE the
+                         passphrase file (otherwise ciphertext + key co-
+                         located makes the encryption useless).
 
-The output schema is intentionally simple so an operator can decrypt
-the encrypted wrapping and restore the values with grep + jq if our
-CLI is unavailable.
+  --plaintext --out PATH (legacy). Writes the bare JSON snapshot to PATH.
+                         The CLI prints a stderr WARNING. Use only when
+                         you intend to encrypt + safekeep the result with
+                         your own tools.
 
-Example:
+Both modes refuse stdout to make the audit trail obvious.
 
-    secrevo export --out /tmp/secrevo-backup-2026-05-12.json
-    gpg --symmetric /tmp/secrevo-backup-2026-05-12.json
-    rm /tmp/secrevo-backup-2026-05-12.json
+Recovery cycle:
+
+    # Encrypt + save kit (two files, separate locations after move).
+    secrevo export --kit --out-dir ~/secrevo-recovery
+    # < move passphrase to password manager, delete the .passphrase file >
+
+    # Decrypt later if you ever need to:
+    secrevo import --recovery-kit ~/secrevo-recovery/secrevo-backup-2026-05-13.json.kit
+    # (planned — for now decrypt with the documented format using gpg-incompatible
+    #  tooling; the file format is in cli/internal/app/recovery_kit.go.)
+
+Examples:
+
+    secrevo export --kit                                 # writes to ./
+    secrevo export --kit --out-dir ~/secrevo-recovery
+    secrevo export --plaintext --out /tmp/snapshot.json  # legacy
 `,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runExportCommand(cmd, opts)
 		},
 	}
-	cmd.Flags().String("out", "", "Destination path (required; refuse stdout for safety)")
-	cmd.Flags().Bool("force", false, "Overwrite if the destination file already exists")
+	cmd.Flags().Bool("kit", false, "Write a Recovery Kit (ciphertext + separate passphrase file). Default when no other mode is selected.")
+	cmd.Flags().String("out-dir", "", "Directory to write the kit files into (kit mode; default: current directory)")
+	cmd.Flags().Bool("plaintext", false, "Write a bare JSON snapshot (no encryption). Requires --out.")
+	cmd.Flags().String("out", "", "Destination path (plaintext mode)")
+	cmd.Flags().Bool("force", false, "Overwrite if destination file(s) already exist")
 	return cmd
 }
 
@@ -245,14 +269,34 @@ func runExportCommand(cmd *cobra.Command, opts Options) error {
 	if err != nil {
 		return err
 	}
+	kitMode, _ := cmd.Flags().GetBool("kit")
+	plaintextMode, _ := cmd.Flags().GetBool("plaintext")
 	outPath, _ := cmd.Flags().GetString("out")
-	if strings.TrimSpace(outPath) == "" {
-		return fmt.Errorf("--out PATH is required; export refuses to write secrets to stdout")
-	}
+	outDir, _ := cmd.Flags().GetString("out-dir")
 	force, _ := cmd.Flags().GetBool("force")
-	if !force {
-		if _, err := os.Stat(outPath); err == nil {
-			return fmt.Errorf("%s already exists; pass --force to overwrite", outPath)
+
+	// Mode resolution. Default to --kit when neither flag is set so the
+	// secure path is what an operator gets by typing `secrevo export`.
+	if !kitMode && !plaintextMode {
+		kitMode = true
+	}
+	if kitMode && plaintextMode {
+		return fmt.Errorf("--kit and --plaintext are mutually exclusive")
+	}
+
+	if plaintextMode {
+		if strings.TrimSpace(outPath) == "" {
+			return fmt.Errorf("--plaintext requires --out PATH; export refuses to write to stdout")
+		}
+		if strings.TrimSpace(outDir) != "" {
+			return fmt.Errorf("--out-dir applies to --kit; use --out with --plaintext")
+		}
+	} else {
+		if strings.TrimSpace(outPath) != "" {
+			return fmt.Errorf("--out applies to --plaintext; use --out-dir with --kit (default)")
+		}
+		if strings.TrimSpace(outDir) == "" {
+			outDir = "."
 		}
 	}
 
@@ -263,8 +307,8 @@ func runExportCommand(cmd *cobra.Command, opts Options) error {
 		}
 		payload := exportPayload{
 			WorkspaceID: workspaceID,
-			Note: "PLAINTEXT secret backup generated by `secrevo export`. " +
-				"Encrypt before sharing or storing remotely (gpg/age/openssl).",
+			Note: "Secret snapshot generated by `secrevo export`. " +
+				"Treat as production credentials material.",
 			Secrets: make([]exportSecretEntry, 0, len(list.Secrets)),
 		}
 		for _, s := range list.Secrets {
@@ -287,15 +331,93 @@ func runExportCommand(cmd *cobra.Command, opts Options) error {
 		if err != nil {
 			return fmt.Errorf("marshal export: %w", err)
 		}
-		if err := writeFileTight(outPath, buf); err != nil {
-			return err
+
+		if plaintextMode {
+			return writePlaintextExport(opts, outPath, force, buf, len(payload.Secrets))
 		}
-		_, _ = fmt.Fprintf(opts.Err,
-			"WARNING: %s contains %d secret value(s) in PLAINTEXT. Encrypt or delete after use.\n",
-			outPath, len(payload.Secrets))
-		_, _ = fmt.Fprintf(opts.Out, "Exported %d secret(s) to %s\n", len(payload.Secrets), outPath)
-		return nil
+		return writeRecoveryKit(opts, outDir, force, buf, len(payload.Secrets))
 	})
+}
+
+func writePlaintextExport(opts Options, outPath string, force bool, buf []byte, count int) error {
+	if !force {
+		if _, err := os.Stat(outPath); err == nil {
+			return fmt.Errorf("%s already exists; pass --force to overwrite", outPath)
+		}
+	}
+	if err := writeFileTight(outPath, buf); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(opts.Err,
+		"WARNING: %s contains %d secret value(s) in PLAINTEXT. Encrypt or delete after use.\n",
+		outPath, count)
+	_, _ = fmt.Fprintf(opts.Out, "Exported %d secret(s) to %s\n", count, outPath)
+	return nil
+}
+
+// writeRecoveryKit produces the two-file Recovery Kit (D-11.6): one
+// ciphertext blob and one passphrase file, written in the same directory
+// but explicitly designed to be split immediately by the operator.
+func writeRecoveryKit(opts Options, outDir string, force bool, plaintext []byte, count int) error {
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", outDir, err)
+	}
+	stamp := nowStamp()
+	cipherPath := filepath.Join(outDir, fmt.Sprintf("secrevo-backup-%s.json.kit", stamp))
+	passPath := filepath.Join(outDir, fmt.Sprintf("secrevo-backup-%s.passphrase", stamp))
+
+	if !force {
+		for _, p := range []string{cipherPath, passPath} {
+			if _, err := os.Stat(p); err == nil {
+				return fmt.Errorf("%s already exists; pass --force to overwrite", p)
+			}
+		}
+	}
+
+	passphrase, err := generateKitPassphrase()
+	if err != nil {
+		return fmt.Errorf("generate passphrase: %w", err)
+	}
+	blob, err := encryptRecoveryKit(plaintext, passphrase)
+	if err != nil {
+		return fmt.Errorf("encrypt kit: %w", err)
+	}
+	if err := writeFileTight(cipherPath, blob); err != nil {
+		return err
+	}
+
+	passphraseFile := fmt.Sprintf(
+		"# Secrevo Recovery Kit passphrase — generated %s\n"+
+			"# Move this single line into your password manager NOW and DELETE this file.\n"+
+			"# Co-locating ciphertext + passphrase defeats the encryption.\n"+
+			"%s\n",
+		stamp, passphrase,
+	)
+	if err := writeFileTight(passPath, []byte(passphraseFile)); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(opts.Out,
+		"Recovery Kit written:\n"+
+			"  ciphertext:  %s  (%d secret values, AES-256-GCM, %d-iter PBKDF2)\n"+
+			"  passphrase:  %s  (move to password manager, then DELETE)\n"+
+			"\n"+
+			"NEXT STEPS (do these now):\n"+
+			"  1. Open the passphrase file, copy the line to your password manager\n"+
+			"     (label suggestion: \"Secrevo recovery kit %s\").\n"+
+			"  2. Delete the passphrase file from disk.\n"+
+			"  3. Store the ciphertext somewhere durable (cloud-backed dir is fine).\n"+
+			"\n"+
+			"Without the passphrase the ciphertext is unrecoverable. Without the\n"+
+			"ciphertext you can always regenerate a fresh kit while Secrevo is up.\n",
+		cipherPath, count, kitDefaultIters, passPath, stamp,
+	)
+	return nil
+}
+
+// nowStamp is overridable from tests so kit filenames are deterministic.
+var nowStamp = func() string {
+	return time.Now().UTC().Format("2006-01-02")
 }
 
 // writeFileTight writes the data to ``path`` with 0600 perms regardless of
