@@ -95,6 +95,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newSecretCommand(opts))
 	root.AddCommand(newAgentCommand(opts))
 	root.AddCommand(newRunCommand(opts))
+	root.AddCommand(newImportCommand(opts))
 
 	return root
 }
