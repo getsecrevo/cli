@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -212,6 +213,124 @@ func TestImportSkipExistingLeavesRotateOff(t *testing.T) {
 	}
 	if len(fake.createCalls) != 1 || fake.createCalls[0].Name != "beta" {
 		t.Fatalf("createCalls = %+v", fake.createCalls)
+	}
+}
+
+// TestImportRecoveryKitRestoresSecrets builds a recovery kit blob in
+// memory, writes it to a temp file, and runs `secrevo import` against
+// it with the passphrase-file flag. The fake API should see Create
+// calls for each secret in the kit, with names/values/descriptions
+// preserved (i.e. no sanitization or path manipulation — kits round-
+// trip 1:1).
+func TestImportRecoveryKitRestoresSecrets(t *testing.T) {
+	payload := exportPayload{
+		WorkspaceID: "workspace-1",
+		Note:        "test fixture",
+		Secrets: []exportSecretEntry{
+			{Name: "OPENAI_API_KEY", SecretID: "secret-1", Value: "sk-live-restored", Description: "restored from kit"},
+			{Name: "STRIPE_API_KEY", SecretID: "secret-2", Value: "sk_test_xyz"},
+		},
+	}
+	plaintext, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	const passphrase = "correct horse battery staple"
+	blob, err := encryptRecoveryKit(plaintext, passphrase)
+	if err != nil {
+		t.Fatalf("encryptRecoveryKit: %v", err)
+	}
+
+	dir := t.TempDir()
+	kitPath := filepath.Join(dir, "snapshot.json.kit")
+	if err := os.WriteFile(kitPath, blob, 0o600); err != nil {
+		t.Fatalf("write kit: %v", err)
+	}
+	passPath := filepath.Join(dir, "pass.txt")
+	if err := os.WriteFile(passPath, []byte(passphrase), 0o600); err != nil {
+		t.Fatalf("write passphrase: %v", err)
+	}
+
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"import", kitPath, "--passphrase-file", passPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.createCalls) != 2 {
+		t.Fatalf("createCalls = %d, want 2 (%+v)", len(fake.createCalls), fake.createCalls)
+	}
+	byName := map[string]client.SecretCreateRequest{}
+	for _, c := range fake.createCalls {
+		byName[c.Name] = c
+	}
+	if got := byName["OPENAI_API_KEY"]; got.Value != "sk-live-restored" || got.Description != "restored from kit" {
+		t.Fatalf("OPENAI entry = %+v", got)
+	}
+	if got := byName["STRIPE_API_KEY"]; got.Value != "sk_test_xyz" {
+		t.Fatalf("STRIPE entry = %+v", got)
+	}
+}
+
+// TestImportRecoveryKitWrongPassphraseSurfacesAuthError ensures the
+// AES-GCM auth tag mismatch is reported with a useful error and never
+// leads to any API call.
+func TestImportRecoveryKitWrongPassphraseSurfacesAuthError(t *testing.T) {
+	payload := exportPayload{WorkspaceID: "ws", Secrets: []exportSecretEntry{{Name: "X", Value: "v"}}}
+	plaintext, _ := json.Marshal(payload)
+	blob, _ := encryptRecoveryKit(plaintext, "the-real-one")
+
+	dir := t.TempDir()
+	kitPath := filepath.Join(dir, "snapshot.json.kit")
+	_ = os.WriteFile(kitPath, blob, 0o600)
+
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "ws",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"import", kitPath, "--passphrase", "wrong"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "decrypt recovery kit") {
+		t.Fatalf("Execute() error = %v, want decrypt-recovery-kit error", err)
+	}
+	if len(fake.createCalls)+len(fake.rotateCalls) != 0 {
+		t.Fatalf("no API call should happen when decrypt fails")
+	}
+}
+
+// TestImportRecoveryKitRequiresPassphrase confirms the import refuses
+// to proceed when no passphrase flag was passed.
+func TestImportRecoveryKitRequiresPassphrase(t *testing.T) {
+	payload := exportPayload{WorkspaceID: "ws", Secrets: []exportSecretEntry{{Name: "X", Value: "v"}}}
+	plaintext, _ := json.Marshal(payload)
+	blob, _ := encryptRecoveryKit(plaintext, "p")
+
+	dir := t.TempDir()
+	kitPath := filepath.Join(dir, "snapshot.json.kit")
+	_ = os.WriteFile(kitPath, blob, 0o600)
+
+	fake := &secretWritingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "ws",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"import", kitPath})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "passphrase") {
+		t.Fatalf("Execute() error = %v, want missing-passphrase error", err)
 	}
 }
 
