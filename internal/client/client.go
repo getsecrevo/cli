@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/getsecrevo/cli/internal/credentials"
 )
 
 var ErrNotConfigured = errors.New("secrevo API client is not configured")
@@ -109,10 +111,32 @@ type AgentCreateResponse struct {
 	Snippet string `json:"snippet"`
 }
 
+// NewFromEnv constructs a client from environment variables, falling back
+// to the persisted credentials file (`secrevo login`) for any field the
+// env didn't set. The env wins per-field so a CI job can override only the
+// pieces it cares about (e.g. SECREVO_WORKSPACE_ID without re-supplying
+// the token).
 func NewFromEnv() (*Client, error) {
+	baseURL := strings.TrimSpace(os.Getenv("SECREVO_API_BASE_URL"))
+	token := strings.TrimSpace(os.Getenv("SECREVO_API_TOKEN"))
+
+	if baseURL == "" || token == "" {
+		path, err := credentials.DefaultPath()
+		if err == nil {
+			if stored, err := credentials.Load(path); err == nil {
+				if baseURL == "" {
+					baseURL = stored.BaseURL
+				}
+				if token == "" {
+					token = stored.Token
+				}
+			}
+		}
+	}
+
 	return New(Config{
-		BaseURL:    os.Getenv("SECREVO_API_BASE_URL"),
-		Token:      os.Getenv("SECREVO_API_TOKEN"),
+		BaseURL:    baseURL,
+		Token:      token,
 		HTTPClient: &http.Client{Timeout: 10 * time.Second},
 	})
 }
