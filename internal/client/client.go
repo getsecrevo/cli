@@ -213,9 +213,9 @@ func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretLis
 	return out, err
 }
 
-// CreateSecret creates a new secret in the workspace and, when ``req.Value``
+// CreateSecret creates a new secret in the workspace and, when “req.Value“
 // is non-empty, writes the value to OpenBao in a single API round-trip.
-// The returned ``Secret`` carries the metadata only — the value is never
+// The returned “Secret“ carries the metadata only — the value is never
 // echoed back.
 func (c *Client) CreateSecret(ctx context.Context, workspaceID string, req SecretCreateRequest) (Secret, error) {
 	var out Secret

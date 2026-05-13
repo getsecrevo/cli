@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// BrowserOpener launches the operator's default browser at ``url`` so they
+// BrowserOpener launches the operator's default browser at “url“ so they
 // can complete an authentication flow. Tests inject a no-op fake.
 type BrowserOpener interface {
 	Open(url string) error

@@ -8,10 +8,10 @@
 // keep `%APPDATA%` private to their account (which is the default).
 //
 // Discovery order, top-to-bottom:
-//   1. ``SECREVO_CONFIG_HOME/credentials.json`` if SECREVO_CONFIG_HOME is set.
-//   2. ``$XDG_CONFIG_HOME/secrevo/credentials.json`` on POSIX.
-//   3. ``~/.config/secrevo/credentials.json`` as the POSIX fallback.
-//   4. ``%APPDATA%\secrevo\credentials.json`` on Windows.
+//  1. “SECREVO_CONFIG_HOME/credentials.json“ if SECREVO_CONFIG_HOME is set.
+//  2. “$XDG_CONFIG_HOME/secrevo/credentials.json“ on POSIX.
+//  3. “~/.config/secrevo/credentials.json“ as the POSIX fallback.
+//  4. “%APPDATA%\secrevo\credentials.json“ on Windows.
 package credentials
 
 import (
@@ -60,7 +60,7 @@ func DefaultPath() (string, error) {
 	return filepath.Join(home, ".config", "secrevo", "credentials.json"), nil
 }
 
-// Load reads the credentials file from ``path``. If the file does not
+// Load reads the credentials file from “path“. If the file does not
 // exist, returns ErrNotFound; the caller decides whether that is fatal.
 func Load(path string) (File, error) {
 	data, err := os.ReadFile(path)

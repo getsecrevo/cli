@@ -327,7 +327,6 @@ Examples:
 	return cmd
 }
 
-
 func newSecretSetCommand(opts Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set <secret-name>",

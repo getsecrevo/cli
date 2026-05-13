@@ -57,13 +57,13 @@ func (f fakeAPIClient) UpdateSecret(context.Context, string, string, client.Secr
 // tests can assert exactly which path was taken. The list of pre-existing
 // secrets is the fixture; everything else accumulates in the call log.
 type secretWritingFake struct {
-	existing      []client.Secret
-	createCalls   []client.SecretCreateRequest
-	rotateCalls   []rotateCall
-	updateCalls   []updateCall
-	rotateErr     error
-	createErr     error
-	updateErr     error
+	existing    []client.Secret
+	createCalls []client.SecretCreateRequest
+	rotateCalls []rotateCall
+	updateCalls []updateCall
+	rotateErr   error
+	createErr   error
+	updateErr   error
 }
 
 type updateCall struct {
@@ -76,8 +76,10 @@ type rotateCall struct {
 	value    string
 }
 
-func (f *secretWritingFake) BaseURL() string                                { return "" }
-func (f *secretWritingFake) Whoami(context.Context) (client.Session, error) { return client.Session{}, nil }
+func (f *secretWritingFake) BaseURL() string { return "" }
+func (f *secretWritingFake) Whoami(context.Context) (client.Session, error) {
+	return client.Session{}, nil
+}
 func (f *secretWritingFake) BootstrapWorkspace(context.Context, client.BootstrapWorkspaceRequest) (client.BootstrapWorkspaceResponse, error) {
 	return client.BootstrapWorkspaceResponse{}, nil
 }

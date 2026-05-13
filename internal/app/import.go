@@ -177,7 +177,7 @@ type importLeaf struct {
 
 // flattenYAML walks a yaml.Node tree and returns one importLeaf per scalar
 // leaf. Sequences and other non-mapping/non-scalar nodes are recorded in
-// ``skipped`` (named by their path) so callers can warn the operator.
+// “skipped“ (named by their path) so callers can warn the operator.
 func flattenYAML(root *yaml.Node, prefix, separator string) ([]importLeaf, []string, error) {
 	var leaves []importLeaf
 	var skipped []string
