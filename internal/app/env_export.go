@@ -32,9 +32,16 @@ the secrets resolved without exporting an ` + "`agt_*`" + ` token long-term:
     secrevo env --secret OPENAI_API_KEY --shell fish | source
 
 Each --secret accepts the same NAME or NAME=ENV_VAR syntax as ` +
-			"`secrevo run`. " + `Combining --all reveals every secret visible to the
-agent and exports each under its canonical name (use with care — a
-typo in your shell history could expose them downstream).
+			"`secrevo run`. " + `When no '=' is provided the secret's name is
+sanitized for POSIX compatibility: letters uppercased, anything non-
+[A-Z0-9_] turned into '_'. So a secret named "aws.cloudwatch.url" emits
+as AWS_CLOUDWATCH_URL — the form most shells actually accept. Pass
+--raw-name to disable sanitization (the export line will then contain
+the literal secret name, which may be invalid in your shell).
+
+Combining --all reveals every secret visible to the agent and exports
+each under its sanitized canonical name (use with care — a typo in your
+shell history could expose them downstream).
 
 The default shell is auto-detected from $SHELL on POSIX and from
 $PSModulePath on Windows; override with --shell.
@@ -47,6 +54,7 @@ $PSModulePath on Windows; override with --shell.
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to emit (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
 	cmd.Flags().Bool("all", false, "Emit every secret visible to the token (mutually exclusive with --secret)")
 	cmd.Flags().String("shell", "", "Shell format: posix, powershell, fish. Default: auto-detect.")
+	cmd.Flags().Bool("raw-name", false, "Emit under the secret's literal name (skip POSIX sanitization)")
 	return cmd
 }
 
@@ -58,6 +66,7 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	rawSpecs, _ := cmd.Flags().GetStringArray("secret")
 	emitAll, _ := cmd.Flags().GetBool("all")
 	shellFlag, _ := cmd.Flags().GetString("shell")
+	rawName, _ := cmd.Flags().GetBool("raw-name")
 
 	if emitAll && len(rawSpecs) > 0 {
 		return fmt.Errorf("--all and --secret are mutually exclusive")
@@ -80,11 +89,15 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 		var specs []secretSpec
 		if emitAll {
 			for _, s := range list.Secrets {
-				specs = append(specs, secretSpec{secretName: s.Name, envName: s.Name})
+				envName := s.Name
+				if !rawName {
+					envName = sanitizeEnvName(s.Name)
+				}
+				specs = append(specs, secretSpec{secretName: s.Name, envName: envName})
 			}
 			sort.Slice(specs, func(i, j int) bool { return specs[i].envName < specs[j].envName })
 		} else {
-			specs, err = parseSecretSpecs(rawSpecs)
+			specs, err = parseSecretSpecs(rawSpecs, !rawName)
 			if err != nil {
 				return err
 			}

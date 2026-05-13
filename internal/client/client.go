@@ -105,6 +105,16 @@ type SecretValueWriteRequest struct {
 	Value string `json:"value"`
 }
 
+// SecretUpdateRequest is the PATCH payload for secret metadata. Every
+// field uses a pointer so a caller that wants to "only rename" sends just
+// {"name": "NEW"} — omitted fields are not touched on the server.
+type SecretUpdateRequest struct {
+	Name                     *string `json:"name,omitempty"`
+	Description              *string `json:"description,omitempty"`
+	RegenerationInstructions *string `json:"regeneration_instructions,omitempty"`
+	Status                   *string `json:"status,omitempty"`
+}
+
 type AgentCreateResponse struct {
 	Agent   Agent  `json:"agent"`
 	Token   string `json:"token"`
@@ -220,6 +230,15 @@ func (c *Client) CreateSecret(ctx context.Context, workspaceID string, req Secre
 func (c *Client) RotateSecretValue(ctx context.Context, workspaceID, secretID, value string) error {
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/value", url.PathEscape(workspaceID), url.PathEscape(secretID))
 	return c.doJSON(ctx, http.MethodPut, path, SecretValueWriteRequest{Value: value}, nil)
+}
+
+// UpdateSecret patches secret metadata. Fields left nil in the request
+// are not touched on the server side.
+func (c *Client) UpdateSecret(ctx context.Context, workspaceID, secretID string, req SecretUpdateRequest) (Secret, error) {
+	var out Secret
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodPatch, path, req, &out)
+	return out, err
 }
 
 func (c *Client) CreateAgent(ctx context.Context, workspaceID string, req AgentCreateRequest) (AgentCreateResponse, error) {

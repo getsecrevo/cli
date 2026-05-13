@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/getsecrevo/cli/internal/client"
@@ -26,6 +27,7 @@ type APIClient interface {
 	RevealSecretValue(context.Context, string, string) (client.SecretValue, error)
 	CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error)
 	RotateSecretValue(context.Context, string, string, string) error
+	UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error)
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
 }
 
@@ -221,10 +223,108 @@ func newSecretCommand(opts Options) *cobra.Command {
 			})
 		},
 	})
+	secret.AddCommand(newSecretListCommand(opts))
 	secret.AddCommand(newSecretSetCommand(opts))
 	secret.AddCommand(newSecretUpdateCommand(opts))
+	secret.AddCommand(newSecretRenameCommand(opts))
 	return secret
 }
+
+func newSecretListCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List every secret visible to the current token",
+		Long: `List secrets in the workspace. The default output is one secret
+name per line, sorted alphabetically — convenient for piping to grep or
+fzf. Pass --json for the structured array (the same shape ` + "`secrets get`" + `
+returns per entry).`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			workspaceID, err := workspaceID(cmd)
+			if err != nil {
+				return err
+			}
+			asJSON, _ := cmd.Flags().GetBool("json")
+			return withClient(opts, func(api APIClient) error {
+				list, err := api.ListSecrets(cmd.Context(), workspaceID)
+				if err != nil {
+					return err
+				}
+				if asJSON {
+					return writeJSON(opts.Out, list)
+				}
+				names := secretNames(list.Secrets)
+				sort.Strings(names)
+				for _, name := range names {
+					_, _ = fmt.Fprintln(opts.Out, name)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().Bool("json", false, "Emit the full list as JSON instead of one name per line")
+	return cmd
+}
+
+func newSecretRenameCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rename <old-name> <new-name>",
+		Short: "Rename a secret without touching its value",
+		Long: `Rename a secret. The value, audit history, and grants are untouched
+— only the metadata name changes. Useful to clean up names imported with
+the legacy '.' separator (` + "`aws.cloudwatch.url`" + ` → ` + "`AWS_CLOUDWATCH_URL`" + `) so
+they're directly usable in ` + "`secrevo env` / `secrevo run`" + ` without --raw-name.
+
+Pass --sanitize to use the canonical POSIX form of <new-name> (the same
+transformation env/run apply by default). With --sanitize, ` + "`<new-name>`" + `
+acts as the seed: ` + "`secrevo secret rename aws.cloud.url _ --sanitize`" + ` is a
+shorthand for ` + "`secrevo secret rename aws.cloud.url AWS_CLOUD_URL`" + `.
+
+Examples:
+
+  secrevo secret rename aws.cloudwatch.url AWS_CLOUDWATCH_URL
+  secrevo secret rename prysmid.idp.google.client_id PRYSMID_GOOGLE_CLIENT_ID
+`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			workspaceID, err := workspaceID(cmd)
+			if err != nil {
+				return err
+			}
+			oldName := args[0]
+			newName := args[1]
+			doSanitize, _ := cmd.Flags().GetBool("sanitize")
+			if doSanitize {
+				newName = sanitizeEnvName(oldName)
+			}
+			if strings.TrimSpace(newName) == "" {
+				return fmt.Errorf("new name is empty after sanitization")
+			}
+			return withClient(opts, func(api APIClient) error {
+				list, err := api.ListSecrets(cmd.Context(), workspaceID)
+				if err != nil {
+					return fmt.Errorf("list secrets: %w", err)
+				}
+				secretID, err := resolveSecretID(list.Secrets, oldName)
+				if err != nil {
+					return err
+				}
+				if existing := findSecretByName(list.Secrets, newName); existing != nil {
+					return fmt.Errorf("a secret named %q already exists in workspace %s", newName, workspaceID)
+				}
+				updated, err := api.UpdateSecret(cmd.Context(), workspaceID, secretID, client.SecretUpdateRequest{Name: &newName})
+				if err != nil {
+					return fmt.Errorf("rename %q: %w", oldName, err)
+				}
+				_, _ = fmt.Fprintf(opts.Out, "Renamed %q -> %q (%s) in workspace %s\n", oldName, updated.Name, updated.SecretID, workspaceID)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().Bool("sanitize", false, "Use the sanitized POSIX form of <old-name>; <new-name> argument is then ignored")
+	return cmd
+}
+
 
 func newSecretSetCommand(opts Options) *cobra.Command {
 	cmd := &cobra.Command{
@@ -450,9 +550,15 @@ func newRunCommand(opts Options) *cobra.Command {
 		Long: `Run a process with Secrevo secrets injected as environment variables.
 
 Each --secret flag names a secret to reveal from the workspace and inject
-into the child process. The default env var name is the secret name verbatim;
-pass --secret NAME=ENV_NAME to rename. Multiple --secret flags are allowed,
-and values are revealed in parallel before the child process starts.
+into the child process. The default env var name is a POSIX-safe form of
+the secret name — letters uppercased, anything non-[A-Z0-9_] turned into '_'.
+For example a secret named "aws.cloudwatch.webhooks.url" injects as
+AWS_CLOUDWATCH_WEBHOOKS_URL. Pass --secret NAME=ENV_NAME to rename
+explicitly, or --raw-name to inject under the secret's literal name (only
+useful when the operator knows their shell handles the non-POSIX form).
+
+Multiple --secret flags are allowed, and values are revealed sequentially
+before the child process starts.
 
 The child inherits stdin/stdout/stderr and the calling process's environment
 (plus the injected secrets). On exit, the CLI exits with the same status
@@ -463,6 +569,7 @@ Examples:
   secrevo run --secret OPENAI_API_KEY -- python app.py
   secrevo run --secret AWS_ACCESS_KEY_ID --secret AWS_SECRET_ACCESS_KEY -- aws s3 ls
   secrevo run --secret prod-stripe=STRIPE_API_KEY -- npm test
+  secrevo run --secret aws.cloudwatch.webhooks.url --raw-name -- legacy-script
 `,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -471,7 +578,8 @@ Examples:
 				return err
 			}
 			rawSpecs, _ := cmd.Flags().GetStringArray("secret")
-			specs, err := parseSecretSpecs(rawSpecs)
+			rawName, _ := cmd.Flags().GetBool("raw-name")
+			specs, err := parseSecretSpecs(rawSpecs, !rawName)
 			if err != nil {
 				return err
 			}
@@ -506,6 +614,7 @@ Examples:
 		},
 	}
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to inject (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
+	cmd.Flags().Bool("raw-name", false, "Inject under the secret's literal name (skip POSIX sanitization)")
 	return cmd
 }
 
@@ -516,7 +625,18 @@ type secretSpec struct {
 	envName    string
 }
 
-func parseSecretSpecs(raw []string) ([]secretSpec, error) {
+// parseSecretSpecs parses repeated --secret flags into specs. When the
+// operator wrote NAME (no '='), the env var name defaults to a sanitized
+// form of NAME so an imported secret named `aws.cloudwatch.webhooks.url`
+// lands as the portable `AWS_CLOUDWATCH_WEBHOOKS_URL`. Pass sanitizeDefault
+// false (e.g. when --raw-name is set) to keep the raw secret name as the
+// env var — only useful when the operator knows their shell tolerates the
+// non-POSIX form.
+//
+// When the operator wrote NAME=ENV_VAR the explicit env var is preserved
+// verbatim regardless of sanitizeDefault: an explicit rename signals the
+// operator picked the form they want.
+func parseSecretSpecs(raw []string, sanitizeDefault bool) ([]secretSpec, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("at least one --secret flag is required")
 	}
@@ -527,13 +647,22 @@ func parseSecretSpecs(raw []string) ([]secretSpec, error) {
 		if entry == "" {
 			return nil, fmt.Errorf("--secret cannot be empty")
 		}
-		secretName, envName := entry, entry
+		secretName := entry
+		var envName string
+		explicit := false
 		if i := strings.Index(entry, "="); i >= 0 {
 			secretName = strings.TrimSpace(entry[:i])
 			envName = strings.TrimSpace(entry[i+1:])
+			explicit = true
 		}
 		if secretName == "" {
 			return nil, fmt.Errorf("--secret %q has empty secret name", entry)
+		}
+		if !explicit {
+			envName = secretName
+			if sanitizeDefault {
+				envName = sanitizeEnvName(secretName)
+			}
 		}
 		if envName == "" {
 			return nil, fmt.Errorf("--secret %q has empty env var name", entry)

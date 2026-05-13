@@ -49,6 +49,9 @@ func (f fakeAPIClient) CreateSecret(context.Context, string, client.SecretCreate
 func (f fakeAPIClient) RotateSecretValue(context.Context, string, string, string) error {
 	return errors.New("fakeAPIClient does not support RotateSecretValue; use secretWritingFake")
 }
+func (f fakeAPIClient) UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error) {
+	return client.Secret{}, errors.New("fakeAPIClient does not support UpdateSecret; use secretWritingFake")
+}
 
 // secretWritingFake captures create/rotate calls so the secret-set/update
 // tests can assert exactly which path was taken. The list of pre-existing
@@ -57,8 +60,15 @@ type secretWritingFake struct {
 	existing      []client.Secret
 	createCalls   []client.SecretCreateRequest
 	rotateCalls   []rotateCall
+	updateCalls   []updateCall
 	rotateErr     error
 	createErr     error
+	updateErr     error
+}
+
+type updateCall struct {
+	secretID string
+	req      client.SecretUpdateRequest
 }
 
 type rotateCall struct {
@@ -104,6 +114,30 @@ func (f *secretWritingFake) RotateSecretValue(_ context.Context, _ string, secre
 	}
 	f.rotateCalls = append(f.rotateCalls, rotateCall{secretID: secretID, value: value})
 	return nil
+}
+func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID string, req client.SecretUpdateRequest) (client.Secret, error) {
+	if f.updateErr != nil {
+		return client.Secret{}, f.updateErr
+	}
+	f.updateCalls = append(f.updateCalls, updateCall{secretID: secretID, req: req})
+	for i := range f.existing {
+		if f.existing[i].SecretID == secretID {
+			if req.Name != nil {
+				f.existing[i].Name = *req.Name
+			}
+			if req.Description != nil {
+				f.existing[i].Description = *req.Description
+			}
+			if req.RegenerationInstructions != nil {
+				f.existing[i].RegenerationInstructions = *req.RegenerationInstructions
+			}
+			if req.Status != nil {
+				f.existing[i].Status = *req.Status
+			}
+			return f.existing[i], nil
+		}
+	}
+	return client.Secret{}, errors.New("secret not found in fake")
 }
 
 func TestCommandParsing(t *testing.T) {
@@ -297,8 +331,44 @@ func TestRunPropagatesChildExitCodeViaCLIExitError(t *testing.T) {
 }
 
 func TestParseSecretSpecsRejectsCollidingEnvNames(t *testing.T) {
-	if _, err := parseSecretSpecs([]string{"a=X", "b=X"}); err == nil {
+	if _, err := parseSecretSpecs([]string{"a=X", "b=X"}, true); err == nil {
 		t.Fatalf("expected an error when two specs share the same env var name")
+	}
+}
+
+func TestParseSecretSpecsSanitizesByDefault(t *testing.T) {
+	specs, err := parseSecretSpecs([]string{"aws.cloudwatch.url", "OPENAI_API_KEY"}, true)
+	if err != nil {
+		t.Fatalf("parseSecretSpecs() error = %v", err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("got %d specs, want 2", len(specs))
+	}
+	if specs[0].secretName != "aws.cloudwatch.url" || specs[0].envName != "AWS_CLOUDWATCH_URL" {
+		t.Fatalf("spec[0] = %+v, want secretName=aws.cloudwatch.url envName=AWS_CLOUDWATCH_URL", specs[0])
+	}
+	if specs[1].secretName != "OPENAI_API_KEY" || specs[1].envName != "OPENAI_API_KEY" {
+		t.Fatalf("spec[1] = %+v, want secretName=OPENAI_API_KEY envName=OPENAI_API_KEY", specs[1])
+	}
+}
+
+func TestParseSecretSpecsExplicitEnvSurvivesSanitization(t *testing.T) {
+	specs, err := parseSecretSpecs([]string{"aws.cloudwatch.url=WEBHOOK"}, true)
+	if err != nil {
+		t.Fatalf("parseSecretSpecs() error = %v", err)
+	}
+	if specs[0].envName != "WEBHOOK" {
+		t.Fatalf("explicit envName = %q, want WEBHOOK", specs[0].envName)
+	}
+}
+
+func TestParseSecretSpecsRawNameKeepsLiteral(t *testing.T) {
+	specs, err := parseSecretSpecs([]string{"aws.cloudwatch.url"}, false)
+	if err != nil {
+		t.Fatalf("parseSecretSpecs() error = %v", err)
+	}
+	if specs[0].envName != "aws.cloudwatch.url" {
+		t.Fatalf("raw-mode envName = %q, want literal", specs[0].envName)
 	}
 }
 
@@ -488,6 +558,110 @@ func TestSecretUpdateAliasesUpdateOnly(t *testing.T) {
 	}
 	if len(fake.rotateCalls) != 1 || fake.rotateCalls[0].value != "sk-rotated" {
 		t.Fatalf("rotateCalls = %+v", fake.rotateCalls)
+	}
+}
+
+func TestSecretListPrintsOneNamePerLine(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{SecretID: "secret-1", Name: "zeta", Status: "active"},
+			{SecretID: "secret-2", Name: "alpha", Status: "active"},
+			{SecretID: "secret-3", Name: "mu", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "list"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	got := strings.TrimSpace(out.String())
+	want := "alpha\nmu\nzeta"
+	if got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestSecretRenameUpdatesNameWithoutTouchingValue(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{SecretID: "secret-1", Name: "aws.cloudwatch.url", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "rename", "aws.cloudwatch.url", "AWS_CLOUDWATCH_URL"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.updateCalls) != 1 || fake.updateCalls[0].req.Name == nil || *fake.updateCalls[0].req.Name != "AWS_CLOUDWATCH_URL" {
+		t.Fatalf("updateCalls = %+v, want one rename to AWS_CLOUDWATCH_URL", fake.updateCalls)
+	}
+	if len(fake.rotateCalls) != 0 {
+		t.Fatalf("rotate must not be called; got %+v", fake.rotateCalls)
+	}
+	if !strings.Contains(out.String(), `Renamed "aws.cloudwatch.url" -> "AWS_CLOUDWATCH_URL"`) {
+		t.Fatalf("output = %q, want rename confirmation", out.String())
+	}
+}
+
+func TestSecretRenameSanitizeShortcut(t *testing.T) {
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{SecretID: "secret-1", Name: "prysmid.idp.google.client_id", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	// Second positional ignored when --sanitize is set; using "_" as a
+	// placeholder reads naturally.
+	cmd.SetArgs([]string{"secret", "rename", "prysmid.idp.google.client_id", "_", "--sanitize"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := *fake.updateCalls[0].req.Name; got != "PRYSMID_IDP_GOOGLE_CLIENT_ID" {
+		t.Fatalf("sanitize-mode rename = %q, want PRYSMID_IDP_GOOGLE_CLIENT_ID", got)
+	}
+}
+
+func TestSecretRenameRefusesIfDestinationAlreadyExists(t *testing.T) {
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{SecretID: "secret-1", Name: "old", Status: "active"},
+			{SecretID: "secret-2", Name: "new", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "rename", "old", "new"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("Execute() error = %v, want already-exists", err)
+	}
+	if len(fake.updateCalls) != 0 {
+		t.Fatalf("must not call UpdateSecret on conflict; got %+v", fake.updateCalls)
 	}
 }
 
