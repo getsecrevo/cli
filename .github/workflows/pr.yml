@@ -1,0 +1,54 @@
+name: pr
+
+# Runs on every pull request targeting main. The cli ships as a Go
+# binary built locally by operators (`go build ./cmd/secrevo`) or via
+# `go install`. There is no central release pipeline yet — this
+# workflow exists to catch breaks at PR time before code lands on main.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet + fmt + test + build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu covers the canonical CI signal; macos surfaces darwin-
+        # specific signal-forwarding issues that ubuntu would miss
+        # (`secrevo run` propagates SIGINT/SIGTERM to the child).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        # `gofmt -l` exits 0 but prints non-conforming files. Treat any
+        # printed path as a failure so style breaks block the PR.
+        run: |
+          unformatted=$(gofmt -l . | tee /dev/stderr)
+          if [ -n "$unformatted" ]; then
+            echo "::error::run 'gofmt -w' on the listed files"
+            exit 1
+          fi
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: go build
+        run: go build ./cmd/secrevo

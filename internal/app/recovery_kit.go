@@ -53,7 +53,7 @@ func generateKitPassphrase() (string, error) {
 }
 
 // encryptRecoveryKit produces the ciphertext blob defined by the file
-// format above. ``passphrase`` is whatever string the operator supplies
+// format above. “passphrase“ is whatever string the operator supplies
 // (random or human-chosen).
 func encryptRecoveryKit(plaintext []byte, passphrase string) ([]byte, error) {
 	salt := make([]byte, kitSaltLen)

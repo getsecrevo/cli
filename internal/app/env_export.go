@@ -251,10 +251,10 @@ Examples:
 }
 
 type exportPayload struct {
-	WorkspaceID string                  `json:"workspace_id"`
-	GeneratedAt string                  `json:"generated_at,omitempty"`
-	Note        string                  `json:"note"`
-	Secrets     []exportSecretEntry     `json:"secrets"`
+	WorkspaceID string              `json:"workspace_id"`
+	GeneratedAt string              `json:"generated_at,omitempty"`
+	Note        string              `json:"note"`
+	Secrets     []exportSecretEntry `json:"secrets"`
 }
 
 type exportSecretEntry struct {
@@ -420,7 +420,7 @@ var nowStamp = func() string {
 	return time.Now().UTC().Format("2006-01-02")
 }
 
-// writeFileTight writes the data to ``path`` with 0600 perms regardless of
+// writeFileTight writes the data to “path“ with 0600 perms regardless of
 // platform. Existing perms are not preserved.
 func writeFileTight(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -433,4 +433,3 @@ func writeFileTight(path string, data []byte) error {
 	}
 	return nil
 }
-
