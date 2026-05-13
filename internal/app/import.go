@@ -18,8 +18,9 @@ func newImportCommand(opts Options) *cobra.Command {
 		Short: "Bulk-import secrets from a devvault-style YAML file",
 		Long: `Walk a YAML file and create one Secrevo secret per leaf value.
 
-Each scalar leaf becomes a secret named by its dotted path, optionally
-prefixed with --prefix. For example, with this file:
+Each scalar leaf becomes a secret named by its path joined with --separator
+(default '_'), optionally prefixed with --prefix. For example, with this
+file:
 
   cloudflare:
     secrevo:
@@ -28,8 +29,14 @@ prefixed with --prefix. For example, with this file:
 
 and ` + "`--prefix cf`" + `, the command creates two secrets:
 
-  cf.cloudflare.secrevo.token
-  cf.cloudflare.secrevo.account_id
+  cf_cloudflare_secrevo_token
+  cf_cloudflare_secrevo_account_id
+
+The '_' default keeps secret names compatible with POSIX environment
+variable names so ` + "`secrevo env`" + ` and ` + "`secrevo run`" + ` inject them under the
+same name without sanitization. Pass --separator '.' for the legacy
+devvault-style dotted names (you'll need --raw-name on env/run for them
+to be usable in shells).
 
 Non-scalar leaves (lists, anchors, multi-doc) are skipped and reported
 in the summary. Numbers and booleans are coerced to their YAML string
@@ -50,10 +57,10 @@ Examples:
 			return runImport(cmd, opts, args[0])
 		},
 	}
-	cmd.Flags().String("prefix", "", "Prefix prepended to every secret name (joined by '.')")
+	cmd.Flags().String("prefix", "", "Prefix prepended to every secret name (joined by the separator)")
 	cmd.Flags().Bool("dry-run", false, "Print the plan without creating or rotating any secret")
 	cmd.Flags().Bool("skip-existing", false, "Skip secrets that already exist instead of rotating their value")
-	cmd.Flags().String("separator", ".", "Separator between path components when generating secret names")
+	cmd.Flags().String("separator", "_", "Separator between path components when generating secret names")
 	return cmd
 }
 
