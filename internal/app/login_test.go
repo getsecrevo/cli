@@ -172,3 +172,81 @@ func TestLogoutDeletesCredentialsFile(t *testing.T) {
 		t.Fatalf("output = %q, want Cleared message", out.String())
 	}
 }
+
+// TestLoginSkipsBrowserWhenCredentialsAlreadyExist confirms the
+// default-off behavior for the browser launch when a credentials
+// file is already present. Re-running `secrevo login` to paste a
+// fresh token should not pop a browser tab the operator does not
+// need.
+func TestLoginSkipsBrowserWhenCredentialsAlreadyExist(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	if err := credentials.Save(credPath, credentials.File{
+		BaseURL:     "https://api.secrevo.local",
+		WorkspaceID: "workspace-1",
+		Token:       "agt_old",
+	}); err != nil {
+		t.Fatalf("seed credentials err = %v", err)
+	}
+
+	browser := &recordingBrowser{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:     "workspace-1",
+		Out:             &bytes.Buffer{},
+		Err:             &bytes.Buffer{},
+		Browser:         browser,
+		LoginVerifier:   func(context.Context, string, string) error { return nil },
+		CredentialsPath: credPath,
+	})
+	cmd.SetArgs([]string{
+		"login",
+		"--base-url", "https://api.secrevo.local",
+		"--dashboard-url", "https://app.secrevo.local",
+		"--token", "agt_new",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if browser.opened != "" {
+		t.Fatalf("expected browser to stay closed when creds already exist; opened %q", browser.opened)
+	}
+}
+
+// TestLoginForceBrowserWithExplicitFlag confirms the operator can
+// override the default-off behavior by passing --no-browser=false.
+func TestLoginForceBrowserWithExplicitFlag(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	if err := credentials.Save(credPath, credentials.File{
+		BaseURL:     "https://api.secrevo.local",
+		WorkspaceID: "workspace-1",
+		Token:       "agt_old",
+	}); err != nil {
+		t.Fatalf("seed credentials err = %v", err)
+	}
+
+	browser := &recordingBrowser{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:     "workspace-1",
+		Out:             &bytes.Buffer{},
+		Err:             &bytes.Buffer{},
+		Browser:         browser,
+		LoginVerifier:   func(context.Context, string, string) error { return nil },
+		CredentialsPath: credPath,
+	})
+	cmd.SetArgs([]string{
+		"login",
+		"--base-url", "https://api.secrevo.local",
+		"--dashboard-url", "https://app.secrevo.local",
+		"--no-browser=false",
+		"--token", "agt_new",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if browser.opened != "https://app.secrevo.local/agents/new?from=cli" {
+		t.Fatalf("expected browser to open with --no-browser=false; opened %q", browser.opened)
+	}
+}

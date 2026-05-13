@@ -75,7 +75,10 @@ Flags:
   --workspace-id   Workspace the token belongs to. Default: env or stored.
   --base-url       API base URL to verify the token against. Default: api.secrevo.com.
   --dashboard-url  Dashboard origin to open. Default: app.secrevo.com.
-  --no-browser     Skip the browser launch; just print the URL.
+  --no-browser     Skip the browser launch; just print the URL. Defaults
+                   to true when a credentials file already exists (the
+                   operator is almost certainly re-pasting a token).
+                   Pass --no-browser=false to force a browser launch.
   --token          Pass the token inline (useful for tests; bypasses prompt).
 `,
 		Args: cobra.NoArgs,
@@ -129,6 +132,17 @@ func runLoginCommand(cmd *cobra.Command, opts Options) error {
 		return errors.New("workspace id is required: pass --workspace-id, set SECREVO_WORKSPACE_ID, or log in to an existing workspace first")
 	}
 
+	// When credentials already exist on disk, the operator is almost
+	// certainly running login to refresh / re-paste a token — not to
+	// see the agent-creation page again. Default to skipping the
+	// browser unless they passed --no-browser=false explicitly.
+	credPath := credentialsPath(opts)
+	if !cmd.Flags().Changed("no-browser") && credPath != "" {
+		if _, err := credentials.Load(credPath); err == nil {
+			skipBrowser = true
+		}
+	}
+
 	agentURL := strings.TrimRight(dashboardURL, "/") + "/agents/new?from=cli"
 	_, _ = fmt.Fprintf(opts.Out, "Open this URL to create an agent and copy its token:\n  %s\n", agentURL)
 	if !skipBrowser {
@@ -163,8 +177,13 @@ func runLoginCommand(cmd *cobra.Command, opts Options) error {
 		return fmt.Errorf("token rejected by %s: %w", baseURL, err)
 	}
 
-	path := strings.TrimSpace(opts.CredentialsPath)
+	path := credPath
 	if path == "" {
+		// Path resolution failed earlier (e.g. no $HOME); surface the
+		// underlying error now so the operator gets the same message
+		// as before — credentialsPath swallows it for the no-browser
+		// check, where "we couldn't decide" should fall through to
+		// the existing default behavior.
 		var err error
 		path, err = credentials.DefaultPath()
 		if err != nil {
@@ -180,6 +199,21 @@ func runLoginCommand(cmd *cobra.Command, opts Options) error {
 	}
 	_, _ = fmt.Fprintf(opts.Out, "Saved credentials to %s\n", path)
 	return nil
+}
+
+// credentialsPath returns the on-disk credentials file path, preferring
+// the explicit override in opts. Returns "" if no path could be resolved
+// (test fixtures with no $HOME, or platforms where credentials.DefaultPath
+// errors). Callers treat "" as "skip credential-aware behavior".
+func credentialsPath(opts Options) string {
+	if p := strings.TrimSpace(opts.CredentialsPath); p != "" {
+		return p
+	}
+	p, err := credentials.DefaultPath()
+	if err != nil {
+		return ""
+	}
+	return p
 }
 
 // readTokenFromStdin prompts the operator for the token. When stdin is a
