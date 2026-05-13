@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -38,10 +39,12 @@ same name without sanitization. Pass --separator '.' for the legacy
 devvault-style dotted names (you'll need --raw-name on env/run for them
 to be usable in shells).
 
-Non-scalar leaves (lists, anchors, multi-doc) are skipped and reported
-in the summary. Numbers and booleans are coerced to their YAML string
-form (the secret value type is text). Duplicates within the file abort
-the run before any API call.
+Sequences of scalars (e.g. ` + "`redirect_uris: [a, b, c]`" + `) are serialized as
+JSON arrays and imported as a single secret whose description records
+the conversion. Mixed/nested sequences and aliases are skipped and
+reported in the summary. Numbers and booleans are coerced to their YAML
+string form (the secret value type is text). Duplicates within the file
+abort the run before any API call.
 
 By default the command rotates already-existing secrets; pass --skip-existing
 to leave them alone. --dry-run prints the plan without touching the API.
@@ -132,8 +135,9 @@ func runImport(cmd *cobra.Command, opts Options, path string) error {
 				continue
 			}
 			if _, err := api.CreateSecret(cmd.Context(), workspaceID, client.SecretCreateRequest{
-				Name:  leaf.name,
-				Value: leaf.value,
+				Name:        leaf.name,
+				Value:       leaf.value,
+				Description: leaf.description,
 			}); err != nil {
 				return fmt.Errorf("create %s: %w", leaf.name, err)
 			}
@@ -171,8 +175,9 @@ func printImportPlan(opts Options, leaves []importLeaf, skipped []string, separa
 
 // importLeaf is one scalar leaf discovered while walking the YAML tree.
 type importLeaf struct {
-	name  string // dotted path, already prefixed
-	value string // scalar text content (numbers/bools coerced to string)
+	name        string // dotted path, already prefixed
+	value       string // scalar text content (numbers/bools coerced to string)
+	description string // optional metadata (populated for serialized lists)
 }
 
 // flattenYAML walks a yaml.Node tree and returns one importLeaf per scalar
@@ -213,12 +218,49 @@ func walkYAML(node *yaml.Node, path, separator string, leaves *[]importLeaf, ski
 			return fmt.Errorf("top-level scalar without a key")
 		}
 		*leaves = append(*leaves, importLeaf{name: path, value: node.Value})
-	case yaml.SequenceNode, yaml.AliasNode:
+	case yaml.SequenceNode:
+		if path == "" {
+			return nil
+		}
+		// Sequences of scalars (the common devvault pattern —
+		// `redirect_uris: [a, b, c]`) serialize as a JSON array so
+		// the secret value round-trips through any consumer that
+		// understands JSON. Mixed/nested sequences fall back to the
+		// existing "skipped" report.
+		values, ok := scalarSequence(node)
+		if !ok {
+			*skipped = append(*skipped, path)
+			return nil
+		}
+		encoded, err := json.Marshal(values)
+		if err != nil {
+			return fmt.Errorf("encode YAML list %q as JSON: %w", path, err)
+		}
+		*leaves = append(*leaves, importLeaf{
+			name:        path,
+			value:       string(encoded),
+			description: "Auto-serialized YAML list (JSON array of strings)",
+		})
+	case yaml.AliasNode:
 		if path != "" {
 			*skipped = append(*skipped, path)
 		}
 	}
 	return nil
+}
+
+// scalarSequence reports whether every child of a SequenceNode is a
+// ScalarNode and returns the collected string values. Returns false on
+// the first non-scalar child so the caller can fall back to skipping.
+func scalarSequence(node *yaml.Node) ([]string, bool) {
+	values := make([]string, 0, len(node.Content))
+	for _, child := range node.Content {
+		if child.Kind != yaml.ScalarNode {
+			return nil, false
+		}
+		values = append(values, child.Value)
+	}
+	return values, true
 }
 
 func joinPath(parent, child, separator string) string {
