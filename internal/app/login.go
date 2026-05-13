@@ -75,6 +75,11 @@ Flags:
   --workspace-id   Workspace the token belongs to. Default: env or stored.
   --base-url       API base URL to verify the token against. Default: api.secrevo.com.
   --dashboard-url  Dashboard origin to open. Default: app.secrevo.com.
+  --loopback       Use the v1 loopback handshake: start a local HTTP
+                   server, open the dashboard's /cli-login page with
+                   the loopback URL as ?callback, wait for the dashboard
+                   to POST the authorized token back. Removes the
+                   manual paste step entirely.
   --no-browser     Skip the browser launch; just print the URL. Defaults
                    to true when a credentials file already exists (the
                    operator is almost certainly re-pasting a token).
@@ -90,6 +95,7 @@ Flags:
 	cmd.Flags().String("base-url", defaultAPIBaseURL, "API base URL to verify the token against")
 	cmd.Flags().String("dashboard-url", defaultDashboardURL, "Dashboard origin to open")
 	cmd.Flags().Bool("no-browser", false, "Skip launching the default browser")
+	cmd.Flags().Bool("loopback", false, "Use the v1 loopback handshake (CLI starts a local HTTP server, dashboard POSTs the token back)")
 	cmd.Flags().String("token", "", "Provide the agent token inline (bypasses the prompt)")
 	return cmd
 }
@@ -122,6 +128,7 @@ func runLoginCommand(cmd *cobra.Command, opts Options) error {
 	baseURL, _ := cmd.Flags().GetString("base-url")
 	workspaceFlag, _ := cmd.Flags().GetString("workspace-id")
 	skipBrowser, _ := cmd.Flags().GetBool("no-browser")
+	useLoopback, _ := cmd.Flags().GetBool("loopback")
 	tokenInline, _ := cmd.Flags().GetString("token")
 
 	workspaceID := strings.TrimSpace(workspaceFlag)
@@ -132,35 +139,56 @@ func runLoginCommand(cmd *cobra.Command, opts Options) error {
 		return errors.New("workspace id is required: pass --workspace-id, set SECREVO_WORKSPACE_ID, or log in to an existing workspace first")
 	}
 
-	// When credentials already exist on disk, the operator is almost
-	// certainly running login to refresh / re-paste a token — not to
-	// see the agent-creation page again. Default to skipping the
-	// browser unless they passed --no-browser=false explicitly.
 	credPath := credentialsPath(opts)
-	if !cmd.Flags().Changed("no-browser") && credPath != "" {
-		if _, err := credentials.Load(credPath); err == nil {
-			skipBrowser = true
-		}
-	}
 
-	agentURL := strings.TrimRight(dashboardURL, "/") + "/agents/new?from=cli"
-	_, _ = fmt.Fprintf(opts.Out, "Open this URL to create an agent and copy its token:\n  %s\n", agentURL)
-	if !skipBrowser {
+	var token string
+	if useLoopback {
+		if strings.TrimSpace(tokenInline) != "" {
+			return errors.New("--loopback and --token are mutually exclusive (loopback captures the token automatically)")
+		}
 		opener := opts.Browser
 		if opener == nil {
 			opener = osBrowserOpener{}
 		}
-		if err := opener.Open(agentURL); err != nil {
-			_, _ = fmt.Fprintf(opts.Err, "Could not launch a browser (%v); open the URL manually.\n", err)
-		}
-	}
-
-	token := strings.TrimSpace(tokenInline)
-	if token == "" {
-		var err error
-		token, err = readTokenFromStdin(opts)
+		res, err := runLoopbackLogin(cmd.Context(), opts, dashboardURL, workspaceID, opener)
 		if err != nil {
-			return err
+			return fmt.Errorf("loopback handshake: %w", err)
+		}
+		token = res.Token
+		if strings.TrimSpace(res.WorkspaceID) != "" {
+			workspaceID = res.WorkspaceID
+		}
+	} else {
+		// When credentials already exist on disk, the operator is
+		// almost certainly running login to refresh / re-paste a
+		// token — not to see the agent-creation page again. Default
+		// to skipping the browser unless they passed --no-browser=
+		// false explicitly.
+		if !cmd.Flags().Changed("no-browser") && credPath != "" {
+			if _, err := credentials.Load(credPath); err == nil {
+				skipBrowser = true
+			}
+		}
+
+		agentURL := strings.TrimRight(dashboardURL, "/") + "/agents/new?from=cli"
+		_, _ = fmt.Fprintf(opts.Out, "Open this URL to create an agent and copy its token:\n  %s\n", agentURL)
+		if !skipBrowser {
+			opener := opts.Browser
+			if opener == nil {
+				opener = osBrowserOpener{}
+			}
+			if err := opener.Open(agentURL); err != nil {
+				_, _ = fmt.Fprintf(opts.Err, "Could not launch a browser (%v); open the URL manually.\n", err)
+			}
+		}
+
+		token = strings.TrimSpace(tokenInline)
+		if token == "" {
+			var err error
+			token, err = readTokenFromStdin(opts)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	if token == "" {
