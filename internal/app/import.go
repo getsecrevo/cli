@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -49,21 +50,35 @@ abort the run before any API call.
 By default the command rotates already-existing secrets; pass --skip-existing
 to leave them alone. --dry-run prints the plan without touching the API.
 
+If <file> begins with the Recovery Kit magic header (` + "`SECREVOKIT01`" + `),
+the command treats it as a kit instead of YAML: decrypts it with the
+passphrase you supply, then routes the embedded secrets through the
+same create-or-rotate code path. --separator / --prefix do NOT apply
+to kit imports — secret names round-trip unchanged so a kit produced
+by ` + "`secrevo export --kit`" + ` is faithfully restored.
+
 Examples:
 
   secrevo import ~/.devvault/secrevo/cloudwatch.yml
   secrevo import ~/.devvault/cloudflare.yml --prefix cloudflare
   secrevo import ~/.devvault/aws.yml --dry-run
+
+  # Restore from a recovery kit (companion to ` + "`secrevo export --kit`" + `):
+  secrevo import ~/secrevo-recovery/secrevo-backup-2026-05-13.json.kit \
+      --passphrase-file ~/secrevo-recovery/secrevo-backup-2026-05-13.passphrase
 `,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runImport(cmd, opts, args[0])
 		},
 	}
-	cmd.Flags().String("prefix", "", "Prefix prepended to every secret name (joined by the separator)")
+	cmd.Flags().String("prefix", "", "Prefix prepended to every secret name (joined by the separator) — YAML-mode only")
 	cmd.Flags().Bool("dry-run", false, "Print the plan without creating or rotating any secret")
 	cmd.Flags().Bool("skip-existing", false, "Skip secrets that already exist instead of rotating their value")
-	cmd.Flags().String("separator", "_", "Separator between path components when generating secret names")
+	cmd.Flags().String("separator", "_", "Separator between path components when generating secret names — YAML-mode only")
+	cmd.Flags().String("passphrase", "", "Recovery Kit passphrase (text). Mutually exclusive with --passphrase-file / --passphrase-from-stdin.")
+	cmd.Flags().String("passphrase-file", "", "Path to a file containing the Recovery Kit passphrase (trailing whitespace trimmed)")
+	cmd.Flags().Bool("passphrase-from-stdin", false, "Read the Recovery Kit passphrase from stdin until EOF")
 	return cmd
 }
 
@@ -85,17 +100,33 @@ func runImport(cmd *cobra.Command, opts Options, path string) error {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 
-	var doc yaml.Node
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
-	}
-
-	leaves, skipped, err := flattenYAML(&doc, prefix, separator)
-	if err != nil {
-		return fmt.Errorf("walk %s: %w", path, err)
+	// Recovery Kit detection: a kit file always starts with the
+	// SECREVOKIT01 magic header (see recovery_kit.go). Branch into the
+	// kit-import path before attempting to parse the file as YAML — a
+	// kit's first bytes are not valid YAML so yaml.Unmarshal would error
+	// with a confusing message.
+	var leaves []importLeaf
+	var skipped []string
+	if isRecoveryKit(raw) {
+		if prefix != "" {
+			return fmt.Errorf("--prefix is not supported in recovery-kit mode (names round-trip unchanged)")
+		}
+		leaves, err = importLeavesFromRecoveryKit(cmd, opts, raw)
+		if err != nil {
+			return err
+		}
+	} else {
+		var doc yaml.Node
+		if err := yaml.Unmarshal(raw, &doc); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		leaves, skipped, err = flattenYAML(&doc, prefix, separator)
+		if err != nil {
+			return fmt.Errorf("walk %s: %w", path, err)
+		}
 	}
 	if len(leaves) == 0 {
-		return fmt.Errorf("no scalar leaves found in %s", path)
+		return fmt.Errorf("no importable secrets found in %s", path)
 	}
 
 	// Detect intra-file duplicates before talking to the API.
@@ -247,6 +278,89 @@ func walkYAML(node *yaml.Node, path, separator string, leaves *[]importLeaf, ski
 		}
 	}
 	return nil
+}
+
+// isRecoveryKit reports whether the file begins with the SECREVOKIT01
+// magic header documented in recovery_kit.go. We don't validate the
+// rest of the header here; the decrypt step does that with a real
+// passphrase.
+func isRecoveryKit(raw []byte) bool {
+	return len(raw) >= kitMagicLen && string(raw[:kitMagicLen]) == kitMagic
+}
+
+// importLeavesFromRecoveryKit decrypts a kit blob, unmarshals the
+// embedded exportPayload, and converts each entry to an importLeaf so
+// the rest of the import pipeline (dry-run, create-or-rotate, skip-
+// existing) treats it the same as a YAML walk.
+func importLeavesFromRecoveryKit(cmd *cobra.Command, opts Options, blob []byte) ([]importLeaf, error) {
+	passphrase, err := resolveKitPassphrase(cmd, opts)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := decryptRecoveryKit(blob, passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt recovery kit: %w", err)
+	}
+	var payload exportPayload
+	if err := json.Unmarshal(plaintext, &payload); err != nil {
+		return nil, fmt.Errorf("parse decrypted kit JSON: %w", err)
+	}
+	leaves := make([]importLeaf, 0, len(payload.Secrets))
+	for _, s := range payload.Secrets {
+		leaves = append(leaves, importLeaf{
+			name:        s.Name,
+			value:       s.Value,
+			description: s.Description,
+		})
+	}
+	return leaves, nil
+}
+
+// resolveKitPassphrase returns the kit passphrase from exactly one of
+// --passphrase / --passphrase-file / --passphrase-from-stdin. Trailing
+// whitespace is trimmed so a passphrase file written by
+// `secrevo export --kit` (which has no trailing newline) round-trips
+// the same as one a human created with a trailing newline.
+func resolveKitPassphrase(cmd *cobra.Command, opts Options) (string, error) {
+	literal, _ := cmd.Flags().GetString("passphrase")
+	filePath, _ := cmd.Flags().GetString("passphrase-file")
+	fromStdin, _ := cmd.Flags().GetBool("passphrase-from-stdin")
+
+	provided := 0
+	if literal != "" {
+		provided++
+	}
+	if filePath != "" {
+		provided++
+	}
+	if fromStdin {
+		provided++
+	}
+	if provided == 0 {
+		return "", fmt.Errorf("recovery kit import requires a passphrase: pass --passphrase, --passphrase-file PATH, or --passphrase-from-stdin")
+	}
+	if provided > 1 {
+		return "", fmt.Errorf("--passphrase, --passphrase-file, and --passphrase-from-stdin are mutually exclusive")
+	}
+	if literal != "" {
+		return literal, nil
+	}
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return "", fmt.Errorf("read passphrase file %s: %w", filePath, err)
+		}
+		return strings.TrimRight(string(data), "\r\n \t"), nil
+	}
+	stdin := opts.Stdin
+	if stdin == nil {
+		stdin = os.Stdin
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", fmt.Errorf("read passphrase from stdin: %w", err)
+	}
+	return strings.TrimRight(string(data), "\r\n \t"), nil
 }
 
 // scalarSequence reports whether every child of a SequenceNode is a
