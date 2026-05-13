@@ -5,6 +5,36 @@ It is a Cat C product repo: product code that consumes the Secrevo API
 contract and helps humans, CI jobs, and future automation drive the platform
 from a local workspace.
 
+## Install
+
+**Linux / macOS** (downloads + sha256-verifies the latest release):
+
+```sh
+curl -fsSL https://github.com/getsecrevo/cli/releases/latest/download/install.sh | bash
+```
+
+**Windows** (PowerShell 5.1+):
+
+```powershell
+irm https://github.com/getsecrevo/cli/releases/latest/download/install.ps1 | iex
+```
+
+Both scripts install to a user-writable location (no sudo): `~/.local/bin` on
+posix, `%LOCALAPPDATA%\secrevo\bin` on Windows. Override with
+`SECREVO_INSTALL_DIR` / `$env:SECREVO_INSTALL_DIR`. Pin to a specific tag with
+`SECREVO_VERSION=v0.2.0` (default: `latest`).
+
+Release artefacts (one per OS/arch — linux/macos/windows × amd64/arm64) ship
+from a tag-driven GitHub Actions workflow that runs goreleaser. See
+[releases](https://github.com/getsecrevo/cli/releases) for the latest tag and
+`checksums.txt`.
+
+From source (requires Go ≥ 1.25):
+
+```sh
+go install github.com/getsecrevo/cli/cmd/secrevo@latest
+```
+
 ## Purpose
 
 The CLI provides the first local surface for Secrevo operators and developers.
