@@ -83,13 +83,12 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	}
 
 	return withClient(opts, func(api APIClient) error {
-		list, err := api.ListSecrets(cmd.Context(), workspaceID)
-		if err != nil {
-			return fmt.Errorf("list secrets: %w", err)
-		}
-
-		var specs []secretSpec
 		if emitAll {
+			list, err := api.ListSecrets(cmd.Context(), workspaceID)
+			if err != nil {
+				return fmt.Errorf("list secrets: %w", err)
+			}
+			specs := make([]secretSpec, 0, len(list.Secrets))
 			for _, s := range list.Secrets {
 				envName := s.Name
 				if !rawName {
@@ -98,19 +97,30 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 				specs = append(specs, secretSpec{secretName: s.Name, envName: envName})
 			}
 			sort.Slice(specs, func(i, j int) bool { return specs[i].envName < specs[j].envName })
-		} else {
-			specs, err = parseSecretSpecs(rawSpecs, !rawName)
-			if err != nil {
-				return err
+			for _, spec := range specs {
+				id, err := resolveSecretID(list.Secrets, spec.secretName)
+				if err != nil {
+					return fmt.Errorf("resolve %s: %w", spec.secretName, err)
+				}
+				revealed, err := api.RevealSecretValue(cmd.Context(), workspaceID, id)
+				if err != nil {
+					return fmt.Errorf("reveal %s: %w", spec.secretName, err)
+				}
+				line, err := shellExportLine(shell, spec.envName, revealed.Value)
+				if err != nil {
+					return err
+				}
+				_, _ = fmt.Fprintln(opts.Out, line)
 			}
+			return nil
 		}
 
+		specs, err := parseSecretSpecs(rawSpecs, !rawName)
+		if err != nil {
+			return err
+		}
 		for _, spec := range specs {
-			id, err := resolveSecretID(list.Secrets, spec.secretName)
-			if err != nil {
-				return fmt.Errorf("resolve %s: %w", spec.secretName, err)
-			}
-			revealed, err := api.RevealSecretValue(cmd.Context(), workspaceID, id)
+			revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, spec.secretName)
 			if err != nil {
 				return fmt.Errorf("reveal %s: %w", spec.secretName, err)
 			}

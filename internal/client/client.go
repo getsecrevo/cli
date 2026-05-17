@@ -206,6 +206,17 @@ func (c *Client) RevealSecretValue(ctx context.Context, workspaceID, secretID st
 	return out, err
 }
 
+// RevealSecretValueByName resolves the secret by (workspace, name) on the
+// server and returns the plaintext value. Lets callers with only a per-secret
+// grant skip ListSecrets — that endpoint requires secret.read@workspace, which
+// is overbroad when the caller already knows the exact secret it needs.
+func (c *Client) RevealSecretValueByName(ctx context.Context, workspaceID, name string) (SecretValue, error) {
+	var out SecretValue
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/value", url.PathEscape(workspaceID), url.PathEscape(name))
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
 func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretListResponse, error) {
 	var out SecretListResponse
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets", url.PathEscape(workspaceID))

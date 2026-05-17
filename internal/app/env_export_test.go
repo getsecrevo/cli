@@ -56,6 +56,50 @@ func TestEnvCommandEmitsPowerShellExports(t *testing.T) {
 	}
 }
 
+func TestEnvCommandUsesByNameRevealAndSkipsListSecrets(t *testing.T) {
+	var out bytes.Buffer
+	client := &trackingAPIClient{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return client, nil },
+	})
+	cmd.SetArgs([]string{"env", "--shell", "posix", "--secret", "OPENAI_API_KEY"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() err = %v", err)
+	}
+	if client.listCalls != 0 {
+		t.Fatalf("ListSecrets called %d times; env --secret must not list", client.listCalls)
+	}
+	if got := client.byNameCalls; len(got) != 1 || got[0] != "OPENAI_API_KEY" {
+		t.Fatalf("RevealSecretValueByName calls = %v, want [OPENAI_API_KEY]", got)
+	}
+}
+
+func TestEnvCommandAllStillCallsListSecrets(t *testing.T) {
+	var out bytes.Buffer
+	client := &trackingAPIClient{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return client, nil },
+	})
+	cmd.SetArgs([]string{"env", "--shell", "posix", "--all"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() err = %v", err)
+	}
+	if client.listCalls != 1 {
+		t.Fatalf("ListSecrets called %d times; --all must enumerate via list", client.listCalls)
+	}
+	if len(client.byNameCalls) != 0 {
+		t.Fatalf("RevealSecretValueByName called for --all: %v; should use by-id path", client.byNameCalls)
+	}
+}
+
 func TestEnvCommandRejectsSecretAndAllTogether(t *testing.T) {
 	cmd := NewRootCommand(Options{
 		WorkspaceID:   "workspace-1",

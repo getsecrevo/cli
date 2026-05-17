@@ -31,6 +31,7 @@ type APIClient interface {
 	ListSecrets(context.Context, string) (client.SecretListResponse, error)
 	GetSecret(context.Context, string, string) (client.Secret, error)
 	RevealSecretValue(context.Context, string, string) (client.SecretValue, error)
+	RevealSecretValueByName(context.Context, string, string) (client.SecretValue, error)
 	CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error)
 	RotateSecretValue(context.Context, string, string, string) error
 	UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error)
@@ -601,14 +602,20 @@ Examples:
 				return err
 			}
 
-			list, err := api.ListSecrets(cmd.Context(), workspaceID)
-			if err != nil {
-				return fmt.Errorf("list workspace secrets: %w", err)
-			}
-
-			var specs []secretSpec
+			var (
+				specs []secretSpec
+				env   []string
+			)
 			if injectAll {
+				list, err := api.ListSecrets(cmd.Context(), workspaceID)
+				if err != nil {
+					return fmt.Errorf("list workspace secrets: %w", err)
+				}
 				specs, err = allSecretSpecs(list.Secrets, !rawName)
+				if err != nil {
+					return err
+				}
+				env, err = buildInjectedEnvFromList(cmd.Context(), api, workspaceID, list, specs)
 				if err != nil {
 					return err
 				}
@@ -617,11 +624,10 @@ Examples:
 				if err != nil {
 					return err
 				}
-			}
-
-			env, err := buildInjectedEnv(cmd.Context(), api, workspaceID, list, specs)
-			if err != nil {
-				return err
+				env, err = buildInjectedEnvByName(cmd.Context(), api, workspaceID, specs)
+				if err != nil {
+					return err
+				}
 			}
 
 			runner := opts.Runner
@@ -731,26 +737,26 @@ func parseSecretSpecs(raw []string, sanitizeDefault bool) ([]secretSpec, error) 
 	return out, nil
 }
 
-// buildInjectedEnv reveals each secret and returns the parent environment
-// extended with the injected variables. Reveal calls happen sequentially
-// because each one emits a separate audit event and the caller wants
-// deterministic ordering in the audit log.
+// buildInjectedEnvFromList reveals each spec by resolving its secretID from
+// the provided list and calling the by-id reveal endpoint. Used by --all,
+// which has already paid for a ListSecrets call to enumerate every visible
+// secret.
+//
+// Reveal calls happen sequentially because each one emits a separate audit
+// event and the caller wants deterministic ordering in the audit log.
 //
 // Two context variables are always appended so the child can detect it
-// runs under `secrevo run` and which workspace was used:
-// SECREVO_RUN=1 and SECREVO_WORKSPACE_ID=<id>. They never carry the
-// agent token — if the child needs to call the API it must inherit
-// SECREVO_API_TOKEN from the parent environment explicitly.
-func buildInjectedEnv(ctx context.Context, api APIClient, workspaceID string, list client.SecretListResponse, specs []secretSpec) ([]string, error) {
+// runs under `secrevo run` and which workspace was used: SECREVO_RUN=1 and
+// SECREVO_WORKSPACE_ID=<id>. They never carry the agent token — if the
+// child needs to call the API it must inherit SECREVO_API_TOKEN from the
+// parent environment explicitly.
+func buildInjectedEnvFromList(ctx context.Context, api APIClient, workspaceID string, list client.SecretListResponse, specs []secretSpec) ([]string, error) {
 	available := make([]string, 0, len(list.Secrets))
 	for _, s := range list.Secrets {
 		available = append(available, s.Name)
 	}
 
-	env := os.Environ()
-	env = append(env, "SECREVO_RUN=1")
-	env = append(env, "SECREVO_WORKSPACE_ID="+workspaceID)
-
+	env := contextEnv(workspaceID)
 	for _, spec := range specs {
 		secretID, err := resolveSecretID(list.Secrets, spec.secretName)
 		if err != nil {
@@ -766,6 +772,28 @@ func buildInjectedEnv(ctx context.Context, api APIClient, workspaceID string, li
 		env = append(env, spec.envName+"="+revealed.Value)
 	}
 	return env, nil
+}
+
+// buildInjectedEnvByName reveals each spec via the by-name reveal endpoint,
+// avoiding ListSecrets (which requires secret.read@workspace). Lets a caller
+// with only per-secret grants run `secrevo run --secret X` successfully.
+func buildInjectedEnvByName(ctx context.Context, api APIClient, workspaceID string, specs []secretSpec) ([]string, error) {
+	env := contextEnv(workspaceID)
+	for _, spec := range specs {
+		revealed, err := api.RevealSecretValueByName(ctx, workspaceID, spec.secretName)
+		if err != nil {
+			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
+		}
+		env = append(env, spec.envName+"="+revealed.Value)
+	}
+	return env, nil
+}
+
+func contextEnv(workspaceID string) []string {
+	env := os.Environ()
+	env = append(env, "SECREVO_RUN=1")
+	env = append(env, "SECREVO_WORKSPACE_ID="+workspaceID)
+	return env
 }
 
 // Runner abstracts subprocess execution so tests can record calls without
