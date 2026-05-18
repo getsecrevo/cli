@@ -56,13 +56,14 @@ type BootstrapWorkspaceResponse struct {
 }
 
 type Secret struct {
-	WorkspaceID              string `json:"workspace_id"`
-	SecretID                 string `json:"secret_id"`
-	Name                     string `json:"name"`
-	Description              string `json:"description"`
-	RegenerationInstructions string `json:"regeneration_instructions"`
-	Status                   string `json:"status"`
-	UpdatedAt                string `json:"updated_at"`
+	WorkspaceID              string   `json:"workspace_id"`
+	SecretID                 string   `json:"secret_id"`
+	Name                     string   `json:"name"`
+	Description              string   `json:"description"`
+	RegenerationInstructions string   `json:"regeneration_instructions"`
+	Status                   string   `json:"status"`
+	Tags                     []string `json:"tags"`
+	UpdatedAt                string   `json:"updated_at"`
 }
 
 type SecretListResponse struct {
