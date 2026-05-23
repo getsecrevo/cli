@@ -2,7 +2,6 @@
 # secrevo CLI installer for Linux / macOS.
 #
 # Usage:
-#   curl -fsSL https://get.secrevo.com/cli | bash
 #   curl -fsSL https://github.com/getsecrevo/cli/releases/latest/download/install.sh | bash
 #
 # Env overrides:
