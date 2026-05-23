@@ -57,13 +57,9 @@ This repo sits at the edge of the product. It translates operator intent into
 Secrevo API calls and prints machine-readable output that other tools can
 consume.
 
-The CLI depends on the API contract documented in:
-- [Secrevo API contract](https://github.com/getsecrevo/api/blob/main/docs/contract.md)
-- [OpenAPI draft](https://github.com/getsecrevo/api/blob/main/docs/openapi.yaml)
-
-The API remains the source of truth for auth, workspace, member, agent,
-secret, grant, access-request, and audit behavior. The CLI is a consumer, not
-the authority.
+The API at [api.secrevo.com](https://api.secrevo.com) remains the source of
+truth for auth, workspace, member, agent, secret, grant, access-request, and
+audit behavior. The CLI is a consumer, not the authority.
 
 ## Primary consumers
 
@@ -147,8 +143,8 @@ The runtime services remain in `api/` and `infrastructure/`.
 
 ## Cross-references
 
-- Governance: <https://github.com/getGanemo/docs-company/blob/main/governance/product-structure.md>
-- Product project management: <https://github.com/getsecrevo/project_management>
-- API implementation: <https://github.com/getsecrevo/api>
-- Infrastructure: <https://github.com/getsecrevo/infrastructure>
+- Product website: <https://secrevo.com>
+- Docs / quickstart: <https://secrevo.com/docs>
+- Python SDK: <https://github.com/getsecrevo/sdk-python> · [PyPI](https://pypi.org/project/secrevo-sdk/)
+- API base URL: <https://api.secrevo.com>
 
