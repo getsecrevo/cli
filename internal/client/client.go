@@ -253,6 +253,15 @@ func (c *Client) UpdateSecret(ctx context.Context, workspaceID, secretID string,
 	return out, err
 }
 
+// DeleteSecret removes a secret from the workspace. The server cascades
+// secret-scoped grants and destroys the OpenBao value + history in the
+// same request. Returns nil on 204; an error including the HTTP status
+// on 4xx/5xx.
+func (c *Client) DeleteSecret(ctx context.Context, workspaceID, secretID string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
 func (c *Client) CreateAgent(ctx context.Context, workspaceID string, req AgentCreateRequest) (AgentCreateResponse, error) {
 	var out AgentCreateResponse
 	path := fmt.Sprintf("/v1/workspaces/%s/agents", url.PathEscape(workspaceID))

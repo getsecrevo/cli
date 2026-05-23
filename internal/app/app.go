@@ -35,6 +35,7 @@ type APIClient interface {
 	CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error)
 	RotateSecretValue(context.Context, string, string, string) error
 	UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error)
+	DeleteSecret(context.Context, string, string) error
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
 }
 
@@ -234,7 +235,102 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretSetCommand(opts))
 	secret.AddCommand(newSecretUpdateCommand(opts))
 	secret.AddCommand(newSecretRenameCommand(opts))
+	secret.AddCommand(newSecretDeleteCommand(opts))
 	return secret
+}
+
+func newSecretDeleteCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "delete <secret-name>",
+		Short: "Delete a secret and cascade-revoke its scoped grants",
+		Long: `Delete a secret from the workspace. The server destroys the OpenBao
+value + history and cascade-revokes every grant scoped to this specific
+secret. Workspace-wide grants are untouched (they only match a real
+authorization when a secret of the same id exists, so they become
+effectively dormant for this id).
+
+By default the command refuses to run when stdin is not a TTY without
+` + "`--yes`" + ` so scripts cannot accidentally delete a secret without an
+explicit confirmation. Interactive sessions get a yes/no prompt that
+echoes the secret name back; any answer other than "y" or "yes"
+aborts.
+
+The deletion is recorded in the workspace audit log under
+` + "`secret.deleted`" + `; the value is unrecoverable from the API.
+
+Examples:
+
+  secrevo secret delete OPENAI_API_KEY            # interactive confirm
+  secrevo secret delete OPENAI_API_KEY --yes      # scripted
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretDelete(cmd, opts, args[0])
+		},
+	}
+	cmd.Flags().Bool("yes", false, "Skip the interactive confirmation prompt; required when stdin is not a TTY")
+	return cmd
+}
+
+func runSecretDelete(cmd *cobra.Command, opts Options, name string) error {
+	workspaceID, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+	yes, _ := cmd.Flags().GetBool("yes")
+
+	if !yes {
+		stdin := opts.Stdin
+		if stdin == nil {
+			stdin = os.Stdin
+		}
+		if !isInteractive(stdin) {
+			return fmt.Errorf("refusing to delete %q without --yes: stdin is not a TTY", name)
+		}
+		_, _ = fmt.Fprintf(opts.Err, "Delete secret %q in workspace %s? [y/N]: ", name, workspaceID)
+		var answer string
+		if _, scanErr := fmt.Fscanln(stdin, &answer); scanErr != nil && !errors.Is(scanErr, io.EOF) {
+			return fmt.Errorf("read confirmation: %w", scanErr)
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			return fmt.Errorf("aborted: confirmation not received (got %q)", answer)
+		}
+	}
+
+	return withClient(opts, func(api APIClient) error {
+		list, err := api.ListSecrets(cmd.Context(), workspaceID)
+		if err != nil {
+			return fmt.Errorf("list secrets: %w", err)
+		}
+		secretID, err := resolveSecretID(list.Secrets, name)
+		if err != nil {
+			return err
+		}
+		if err := api.DeleteSecret(cmd.Context(), workspaceID, secretID); err != nil {
+			return fmt.Errorf("delete secret %q: %w", name, err)
+		}
+		_, _ = fmt.Fprintf(opts.Out, "Deleted secret %q (%s) in workspace %s\n", name, secretID, workspaceID)
+		return nil
+	})
+}
+
+// isInteractive reports whether the reader is a real terminal. It is used
+// by `secret delete` to refuse running without --yes in non-interactive
+// contexts (CI scripts, piped stdin) so a runaway loop cannot delete a
+// secret without an explicit operator gesture. The implementation is
+// best-effort: any reader that doesn't expose an *os.File underlying
+// descriptor is treated as non-interactive.
+func isInteractive(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
 func newSecretListCommand(opts Options) *cobra.Command {
