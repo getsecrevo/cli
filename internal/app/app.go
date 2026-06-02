@@ -63,6 +63,14 @@ type Options struct {
 	// CredentialsPath overrides the on-disk credentials file location.
 	// Tests inject a temp path; production uses credentials.DefaultPath().
 	CredentialsPath string
+	// SSHRunner is the side-effecting executor used by `secrevo ssh-run`.
+	// Tests inject a fake; production wiring leaves it nil so the per-platform
+	// default (defaultSSHRunner in ssh_run_{unix,windows}.go) is used.
+	SSHRunner sshRunner
+	// SecretRevealer overrides the by-name reveal used by `secrevo ssh-run`.
+	// Tests inject a fake to assert reveal failures don't spawn ssh-agent;
+	// production leaves it nil so the APIClient is used directly.
+	SecretRevealer secretRevealer
 }
 
 func Execute(args []string, out, errOut io.Writer) error {
@@ -127,6 +135,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newSecretCommand(opts))
 	root.AddCommand(newAgentCommand(opts))
 	root.AddCommand(newRunCommand(opts))
+	root.AddCommand(newSSHRunCommand(opts))
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))
 	root.AddCommand(newExportCommand(opts))
