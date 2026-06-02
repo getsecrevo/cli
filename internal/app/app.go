@@ -236,7 +236,104 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretUpdateCommand(opts))
 	secret.AddCommand(newSecretRenameCommand(opts))
 	secret.AddCommand(newSecretDeleteCommand(opts))
+	secret.AddCommand(newSecretRevealCommand(opts))
 	return secret
+}
+
+func newSecretRevealCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reveal <secret-name>",
+		Short: "Reveal a secret's value (one-off; for scripts prefer `run`/`env --secret`)",
+		Long: `Reveal a secret's value. Intended for interactive one-off lookups —
+for scripts that feed a value to a process, ` + "`secrevo run --secret`" + ` or
+` + "`secrevo env --secret`" + ` are safer (no value ever lands in the shell
+history or a logged transcript).
+
+The value source must be exactly one destination:
+
+  --allow-stdout            Print the value to stdout (mandatory consent).
+  --to-file PATH            Write the value to PATH (POSIX: chmod 0600) and
+                            print nothing.
+
+` + "`--allow-stdout`" + ` is mandatory when stdout is the destination — without it
+the command refuses to print the value and prints an actionable error
+pointing at the two safe alternatives. Pair it with ` + "`--json`" + ` to emit a
+` + "`{value, secret_id, workspace_id}`" + ` envelope instead of the bare value
+(useful when consuming from a structured wrapper).
+
+Every reveal is recorded in the workspace audit log under
+` + "`secret.read`" + `; the value is unrecoverable from the API.
+
+Examples:
+
+  secrevo secret reveal OPENAI_API_KEY --allow-stdout
+  secrevo secret reveal OPENAI_API_KEY --allow-stdout --json
+  secrevo secret reveal SSH_KEY --to-file ./id_ed25519
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretReveal(cmd, opts, args[0])
+		},
+	}
+	cmd.Flags().Bool("allow-stdout", false, "Print the value to stdout (required when --to-file is not set)")
+	cmd.Flags().Bool("json", false, "With --allow-stdout, emit {value, secret_id, workspace_id} as JSON instead of the bare value")
+	cmd.Flags().String("to-file", "", "Write the value to PATH (POSIX: chmod 0600) and print nothing")
+	return cmd
+}
+
+func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
+	workspaceID, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+	allowStdout, _ := cmd.Flags().GetBool("allow-stdout")
+	asJSON, _ := cmd.Flags().GetBool("json")
+	toFile, _ := cmd.Flags().GetString("to-file")
+
+	if toFile != "" && allowStdout {
+		return fmt.Errorf("--to-file and --allow-stdout are mutually exclusive: pick one destination")
+	}
+	if toFile == "" && !allowStdout {
+		return fmt.Errorf(
+			"refusing to print secret %q to stdout without explicit consent.\n"+
+				"  Pass --allow-stdout to confirm, or use --to-file PATH to materialize without printing.\n"+
+				"  Either way the reveal is recorded in the workspace audit log under \"secret.read\".",
+			name,
+		)
+	}
+	if toFile != "" && asJSON {
+		return fmt.Errorf("--json applies only to --allow-stdout output; remove it when using --to-file")
+	}
+
+	return withClient(opts, func(api APIClient) error {
+		revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, name)
+		if err != nil {
+			return fmt.Errorf("reveal secret %q: %w", name, err)
+		}
+		if toFile != "" {
+			return writeSecretToFile(toFile, revealed.Value, opts)
+		}
+		if asJSON {
+			return writeJSON(opts.Out, revealed)
+		}
+		_, err = fmt.Fprintln(opts.Out, revealed.Value)
+		return err
+	})
+}
+
+// writeSecretToFile materializes a revealed value at path with restrictive
+// permissions. On POSIX the file is created with mode 0600 so a sibling
+// process owned by the same user cannot mmap it. On Windows the ACL of the
+// containing directory governs access (DPAPI is not in scope here — this
+// is a transient materialization, not a credential store). The function
+// truncates an existing file at the path; the caller is responsible for
+// cleanup.
+func writeSecretToFile(path, value string, opts Options) error {
+	if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	_, _ = fmt.Fprintf(opts.Err, "Wrote secret to %s (mode 0600)\n", path)
+	return nil
 }
 
 func newSecretDeleteCommand(opts Options) *cobra.Command {
