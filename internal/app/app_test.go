@@ -40,6 +40,33 @@ func (f fakeAPIClient) RevealSecretValue(_ context.Context, _ string, secretID s
 	}
 	return client.SecretValue{}, errors.New("unknown secret id")
 }
+func (f fakeAPIClient) RevealSecretValueByName(_ context.Context, _ string, name string) (client.SecretValue, error) {
+	switch name {
+	case "db-password":
+		return client.SecretValue{WorkspaceID: "workspace-1", SecretID: "secret-1", Value: "db-password-value"}, nil
+	case "OPENAI_API_KEY":
+		return client.SecretValue{WorkspaceID: "workspace-1", SecretID: "secret-2", Value: "sk-live-openai"}, nil
+	}
+	return client.SecretValue{}, errors.New("unknown secret name")
+}
+
+// trackingAPIClient counts list/by-name calls so tests can prove the run/env
+// commands no longer touch ListSecrets when --secret is used.
+type trackingAPIClient struct {
+	fakeAPIClient
+	listCalls   int
+	byNameCalls []string
+}
+
+func (t *trackingAPIClient) ListSecrets(ctx context.Context, ws string) (client.SecretListResponse, error) {
+	t.listCalls++
+	return t.fakeAPIClient.ListSecrets(ctx, ws)
+}
+
+func (t *trackingAPIClient) RevealSecretValueByName(ctx context.Context, ws, name string) (client.SecretValue, error) {
+	t.byNameCalls = append(t.byNameCalls, name)
+	return t.fakeAPIClient.RevealSecretValueByName(ctx, ws, name)
+}
 func (f fakeAPIClient) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
 	return client.AgentCreateResponse{Token: "token-1", Snippet: "export SECREVO_AGENT_TOKEN=token-1"}, nil
 }
@@ -90,6 +117,9 @@ func (f *secretWritingFake) GetSecret(context.Context, string, string) (client.S
 	return client.Secret{}, errors.New("not implemented")
 }
 func (f *secretWritingFake) RevealSecretValue(context.Context, string, string) (client.SecretValue, error) {
+	return client.SecretValue{}, errors.New("not implemented")
+}
+func (f *secretWritingFake) RevealSecretValueByName(context.Context, string, string) (client.SecretValue, error) {
 	return client.SecretValue{}, errors.New("not implemented")
 }
 func (f *secretWritingFake) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
@@ -290,7 +320,7 @@ func TestRunInjectsRevealedSecretsIntoChildEnv(t *testing.T) {
 	}
 }
 
-func TestRunReportsUnknownSecretWithAvailableNames(t *testing.T) {
+func TestRunReportsUnknownSecretWithName(t *testing.T) {
 	var out bytes.Buffer
 	runner := &recordingRunner{}
 	cmd := NewRootCommand(Options{
@@ -305,11 +335,46 @@ func TestRunReportsUnknownSecretWithAvailableNames(t *testing.T) {
 	cmd.SetArgs([]string{"run", "--secret", "MISSING", "--", "echo", "x"})
 
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "Available:") {
-		t.Fatalf("Execute() error = %v, want available-names hint", err)
+	if err == nil || !strings.Contains(err.Error(), `reveal secret "MISSING"`) {
+		t.Fatalf("Execute() error = %v, want wrapped reveal-by-name error mentioning the secret", err)
 	}
 	if runner.spec.Command != "" {
 		t.Fatalf("runner should not have been invoked; got %+v", runner.spec)
+	}
+}
+
+func TestRunUsesByNameRevealAndSkipsListSecrets(t *testing.T) {
+	var out bytes.Buffer
+	runner := &recordingRunner{}
+	client := &trackingAPIClient{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return client, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--secret", "OPENAI_API_KEY", "--", "echo", "x"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() err = %v", err)
+	}
+	if client.listCalls != 0 {
+		t.Fatalf("ListSecrets called %d times; --secret path must not list (defeats the per-secret-grant goal)", client.listCalls)
+	}
+	if got := client.byNameCalls; len(got) != 1 || got[0] != "OPENAI_API_KEY" {
+		t.Fatalf("RevealSecretValueByName calls = %v, want [OPENAI_API_KEY]", got)
+	}
+	var sawEnv bool
+	for _, kv := range runner.spec.Env {
+		if kv == "OPENAI_API_KEY=sk-live-openai" {
+			sawEnv = true
+		}
+	}
+	if !sawEnv {
+		t.Fatalf("child env missing OPENAI_API_KEY injection; env=%v", runner.spec.Env)
 	}
 }
 
