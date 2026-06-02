@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -975,5 +977,125 @@ func TestSecretDeletePropagatesAPIError(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("Execute() error = %v, want API error", err)
+	}
+}
+
+func TestSecretRevealWithoutAllowStdoutRefuses(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &errOut,
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--allow-stdout") {
+		t.Fatalf("Execute() error = %v, want consent-required error mentioning --allow-stdout", err)
+	}
+	if !strings.Contains(err.Error(), "--to-file") {
+		t.Fatalf("error should also point at --to-file alternative; got %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout must be empty when value is refused; got %q", out.String())
+	}
+}
+
+func TestSecretRevealAllowStdoutPrintsValue(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &errOut,
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--allow-stdout"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := strings.TrimRight(out.String(), "\r\n"); got != "db-password-value" {
+		t.Fatalf("stdout = %q, want exact value", got)
+	}
+}
+
+func TestSecretRevealJSONEnvelope(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--allow-stdout", "--json"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "\"value\": \"db-password-value\"") {
+		t.Fatalf("output = %q, want JSON envelope containing value", out.String())
+	}
+	if !strings.Contains(out.String(), "\"secret_id\": \"secret-1\"") {
+		t.Fatalf("output = %q, want JSON envelope containing secret_id", out.String())
+	}
+}
+
+func TestSecretRevealToFileWritesAndDoesNotPrint(t *testing.T) {
+	var out bytes.Buffer
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "secret.bin")
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--to-file", path})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout must be empty when --to-file is used; got %q", out.String())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read materialized file: %v", err)
+	}
+	if string(data) != "db-password-value" {
+		t.Fatalf("file content length=%d, want exact value bytes", len(data))
+	}
+}
+
+func TestSecretRevealRejectsToFileWithAllowStdout(t *testing.T) {
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--allow-stdout", "--to-file", "/tmp/x"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("Execute() error = %v, want mutual-exclusion error", err)
+	}
+}
+
+func TestSecretRevealRejectsJSONWithToFile(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "secret.bin")
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return fakeAPIClient{}, nil },
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--to-file", path, "--json"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--json applies only to --allow-stdout") {
+		t.Fatalf("Execute() error = %v, want --json/--to-file conflict error", err)
 	}
 }
