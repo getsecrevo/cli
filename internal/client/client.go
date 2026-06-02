@@ -74,6 +74,11 @@ type SecretValue struct {
 	WorkspaceID string `json:"workspace_id"`
 	SecretID    string `json:"secret_id"`
 	Value       string `json:"value"`
+	// GraceExpiresAt is the ISO-8601 timestamp at which the previous value
+	// referenced by `?version=previous` will be discarded. Populated from
+	// the `X-Secrevo-Grace-Expires-At` response header. Empty for the
+	// current version (the live value has no expiry).
+	GraceExpiresAt string `json:"grace_expires_at,omitempty"`
 }
 
 type Agent struct {
@@ -211,11 +216,27 @@ func (c *Client) RevealSecretValue(ctx context.Context, workspaceID, secretID st
 // server and returns the plaintext value. Lets callers with only a per-secret
 // grant skip ListSecrets — that endpoint requires secret.read@workspace, which
 // is overbroad when the caller already knows the exact secret it needs.
-func (c *Client) RevealSecretValueByName(ctx context.Context, workspaceID, name string) (SecretValue, error) {
+//
+// version selects which value to return: "" or "current" returns the live
+// value; "previous" returns the snapshot captured by a `?grace=<duration>`
+// rotation (api#46). For "previous", the response carries
+// X-Secrevo-Grace-Expires-At which is surfaced as SecretValue.GraceExpiresAt.
+// A 404 with body containing `not_found_previous` indicates the grace window
+// expired or the rotation didn't request one.
+func (c *Client) RevealSecretValueByName(ctx context.Context, workspaceID, name, version string) (SecretValue, error) {
 	var out SecretValue
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/value", url.PathEscape(workspaceID), url.PathEscape(name))
-	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
-	return out, err
+	if v := strings.TrimSpace(version); v != "" && v != "current" {
+		path += "?version=" + url.QueryEscape(v)
+	}
+	header, err := c.doJSONWithHeader(ctx, http.MethodGet, path, nil, &out)
+	if err != nil {
+		return out, err
+	}
+	if header != nil {
+		out.GraceExpiresAt = header.Get("X-Secrevo-Grace-Expires-At")
+	}
+	return out, nil
 }
 
 func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretListResponse, error) {
@@ -237,10 +258,17 @@ func (c *Client) CreateSecret(ctx context.Context, workspaceID string, req Secre
 }
 
 // RotateSecretValue overwrites the value of an existing secret without
-// touching metadata. The previous value is unrecoverable from the API
-// (the workspace's audit log records the rotation event).
-func (c *Client) RotateSecretValue(ctx context.Context, workspaceID, secretID, value string) error {
+// touching metadata.
+//
+// grace, when non-empty, requests a grace window during which the previous
+// value remains retrievable via `?version=previous`. Format is
+// `<int><h|m|s>` (validated by the server, range 1m..168h). When grace is
+// empty the rotation is irrecoverable, matching pre-api#46 behavior.
+func (c *Client) RotateSecretValue(ctx context.Context, workspaceID, secretID, value, grace string) error {
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/value", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	if g := strings.TrimSpace(grace); g != "" {
+		path += "?grace=" + url.QueryEscape(g)
+	}
 	return c.doJSON(ctx, http.MethodPut, path, SecretValueWriteRequest{Value: value}, nil)
 }
 
@@ -270,22 +298,31 @@ func (c *Client) CreateAgent(ctx context.Context, workspaceID string, req AgentC
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, reqBody any, respBody any) error {
+	_, err := c.doJSONWithHeader(ctx, method, path, reqBody, respBody)
+	return err
+}
+
+// doJSONWithHeader is doJSON that exposes the response headers to the caller.
+// Used by endpoints that surface server-side metadata via headers (e.g. the
+// X-Secrevo-Grace-Expires-At header on `?version=previous` reads). Returns
+// nil headers when the request failed before a response was produced.
+func (c *Client) doJSONWithHeader(ctx context.Context, method, path string, reqBody any, respBody any) (http.Header, error) {
 	if c == nil || c.baseURL == nil || c.httpClient == nil || c.token == "" {
-		return ErrNotConfigured
+		return nil, ErrNotConfigured
 	}
 
 	var bodyReader io.Reader
 	if reqBody != nil {
 		payload, err := json.Marshal(reqBody)
 		if err != nil {
-			return fmt.Errorf("marshal request payload: %w", err)
+			return nil, fmt.Errorf("marshal request payload: %w", err)
 		}
 		bodyReader = bytes.NewReader(payload)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.resolve(path), bodyReader)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
@@ -296,25 +333,25 @@ func (c *Client) doJSON(ctx context.Context, method, path string, reqBody any, r
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("perform request: %w", err)
+		return nil, fmt.Errorf("perform request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		message, _ := io.ReadAll(resp.Body)
 		if len(message) == 0 {
-			return fmt.Errorf("api returned %s", resp.Status)
+			return resp.Header, fmt.Errorf("api returned %s", resp.Status)
 		}
-		return fmt.Errorf("api returned %s: %s", resp.Status, strings.TrimSpace(string(message)))
+		return resp.Header, fmt.Errorf("api returned %s: %s", resp.Status, strings.TrimSpace(string(message)))
 	}
 
 	if respBody == nil {
-		return nil
+		return resp.Header, nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(respBody); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return resp.Header, fmt.Errorf("decode response: %w", err)
 	}
-	return nil
+	return resp.Header, nil
 }
 
 func (c *Client) resolve(path string) string {

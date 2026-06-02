@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -17,6 +18,13 @@ import (
 	"github.com/getsecrevo/cli/internal/credentials"
 	"github.com/spf13/cobra"
 )
+
+// mustCompileGraceRe compiles the grace-window regex at package init.
+// Kept as a function so the regex literal is visible to readers without
+// a global init() block.
+func mustCompileGraceRe() *regexp.Regexp {
+	return regexp.MustCompile(`^[1-9][0-9]*(h|m|s)$`)
+}
 
 // defaultVersion is overridden at build time via
 // `-ldflags '-X github.com/getsecrevo/cli/internal/app.defaultVersion=v0.X.Y'`
@@ -31,9 +39,9 @@ type APIClient interface {
 	ListSecrets(context.Context, string) (client.SecretListResponse, error)
 	GetSecret(context.Context, string, string) (client.Secret, error)
 	RevealSecretValue(context.Context, string, string) (client.SecretValue, error)
-	RevealSecretValueByName(context.Context, string, string) (client.SecretValue, error)
+	RevealSecretValueByName(context.Context, string, string, string) (client.SecretValue, error)
 	CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error)
-	RotateSecretValue(context.Context, string, string, string) error
+	RotateSecretValue(context.Context, string, string, string, string) error
 	UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error)
 	DeleteSecret(context.Context, string, string) error
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
@@ -292,6 +300,7 @@ Examples:
 	cmd.Flags().Bool("allow-stdout", false, "Print the value to stdout (required when --to-file is not set)")
 	cmd.Flags().Bool("json", false, "With --allow-stdout, emit {value, secret_id, workspace_id} as JSON instead of the bare value")
 	cmd.Flags().String("to-file", "", "Write the value to PATH (POSIX: chmod 0600) and print nothing")
+	cmd.Flags().String("version", "current", "Which value to read: 'current' (live) or 'previous' (the snapshot from a `--grace` rotation, if still in window). Scripted commands like `run`/`env --secret` always read 'current'; reading 'previous' is a one-off operator action.")
 	return cmd
 }
 
@@ -303,6 +312,7 @@ func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
 	allowStdout, _ := cmd.Flags().GetBool("allow-stdout")
 	asJSON, _ := cmd.Flags().GetBool("json")
 	toFile, _ := cmd.Flags().GetString("to-file")
+	version, _ := cmd.Flags().GetString("version")
 
 	if toFile != "" && allowStdout {
 		return fmt.Errorf("--to-file and --allow-stdout are mutually exclusive: pick one destination")
@@ -318,21 +328,54 @@ func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
 	if toFile != "" && asJSON {
 		return fmt.Errorf("--json applies only to --allow-stdout output; remove it when using --to-file")
 	}
+	switch strings.TrimSpace(version) {
+	case "", "current", "previous":
+	default:
+		return fmt.Errorf("--version must be 'current' or 'previous'; got %q", version)
+	}
 
 	return withClient(opts, func(api APIClient) error {
-		revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, name)
+		revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, name, version)
 		if err != nil {
+			if isNotFoundPrevious(err) {
+				return fmt.Errorf(
+					"No previous value available for %q. Either the rotation was done without --grace, or the grace window expired.",
+					name,
+				)
+			}
 			return fmt.Errorf("reveal secret %q: %w", name, err)
 		}
 		if toFile != "" {
-			return writeSecretToFile(toFile, revealed.Value, opts)
+			if err := writeSecretToFile(toFile, revealed.Value, opts); err != nil {
+				return err
+			}
+			if revealed.GraceExpiresAt != "" {
+				_, _ = fmt.Fprintf(opts.Err, "(previous value written to %s; grace expires at %s)\n", toFile, revealed.GraceExpiresAt)
+			}
+			return nil
 		}
 		if asJSON {
 			return writeJSON(opts.Out, revealed)
 		}
+		if revealed.GraceExpiresAt != "" {
+			_, _ = fmt.Fprintf(opts.Err, "(previous value, grace expires at %s)\n", revealed.GraceExpiresAt)
+		}
 		_, err = fmt.Fprintln(opts.Out, revealed.Value)
 		return err
 	})
+}
+
+// isNotFoundPrevious recognizes the api#46 sentinel returned when the caller
+// asked for `?version=previous` but no snapshot is available (rotation
+// happened without --grace, or the window expired). The api returns
+// 404 with a body containing the token "not_found_previous"; the client
+// wraps the body verbatim into the error string.
+func isNotFoundPrevious(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "404") && strings.Contains(msg, "not_found_previous")
 }
 
 // writeSecretToFile materializes a revealed value at path with restrictive
@@ -576,6 +619,7 @@ Examples:
 	cmd.Flags().String("regeneration-instructions", "", "Optional notes on how to rotate this secret (used only when creating)")
 	cmd.Flags().Bool("update-only", false, "Refuse to create the secret if it does not exist")
 	cmd.Flags().Bool("create-only", false, "Refuse to rotate the secret if it already exists")
+	cmd.Flags().String("grace", "", "On rotation, keep the previous value retrievable via `secret reveal --version previous` for this duration (e.g. 30m, 2h, 24h). Format: <int><h|m|s>, range 1m..168h. Errors if the secret does not yet exist (no rotation happens on creation).")
 	return cmd
 }
 
@@ -599,6 +643,7 @@ Examples:
 	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
 	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
 	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
+	cmd.Flags().String("grace", "", "Keep the previous value retrievable via `secret reveal --version previous` for this duration (e.g. 30m, 2h, 24h). Format: <int><h|m|s>, range 1m..168h.")
 	return cmd
 }
 
@@ -623,6 +668,15 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 	}
 	description, _ := cmd.Flags().GetString("description")
 	regeneration, _ := cmd.Flags().GetString("regeneration-instructions")
+	grace := ""
+	if f := cmd.Flags().Lookup("grace"); f != nil {
+		grace = strings.TrimSpace(f.Value.String())
+	}
+	if grace != "" {
+		if !graceDurationRe.MatchString(grace) {
+			return fmt.Errorf("--grace must match <int><h|m|s> (e.g. 30m, 2h, 24h); got %q", grace)
+		}
+	}
 
 	return withClient(opts, func(api APIClient) error {
 		list, err := api.ListSecrets(cmd.Context(), workspaceID)
@@ -635,11 +689,23 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 			if createOnly {
 				return fmt.Errorf("secret %q already exists in workspace %q", name, workspaceID)
 			}
-			if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, value); err != nil {
+			if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, value, grace); err != nil {
 				return fmt.Errorf("rotate secret value: %w", err)
 			}
-			_, _ = fmt.Fprintf(opts.Out, "Rotated secret %q (%s) in workspace %s\n", name, existing.SecretID, workspaceID)
+			if grace != "" {
+				_, _ = fmt.Fprintf(opts.Out, "Rotated secret %q (%s) in workspace %s (grace: previous value retrievable for %s)\n", name, existing.SecretID, workspaceID, grace)
+			} else {
+				_, _ = fmt.Fprintf(opts.Out, "Rotated secret %q (%s) in workspace %s\n", name, existing.SecretID, workspaceID)
+			}
 			return nil
+		}
+
+		if grace != "" {
+			return fmt.Errorf(
+				"--grace applies only to rotation; the secret %q doesn't exist yet. "+
+					"Use `secret set %s --value ...` without --grace to create it first, then rotate with --grace.",
+				name, name,
+			)
 		}
 
 		if updateOnly {
@@ -663,6 +729,12 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 		return nil
 	})
 }
+
+// graceDurationRe matches the `<int><h|m|s>` format accepted by the api.
+// Range validation (1m..168h) happens server-side; the client only ensures
+// the shape is valid so we can fail before the HTTP round-trip on obvious
+// typos. Leading zeros are rejected to keep parity with the api's parser.
+var graceDurationRe = mustCompileGraceRe()
 
 func readSecretValue(cmd *cobra.Command, opts Options) (string, error) {
 	literal, _ := cmd.Flags().GetString("value")
@@ -987,7 +1059,7 @@ func buildInjectedEnvFromList(ctx context.Context, api APIClient, workspaceID st
 func buildInjectedEnvByName(ctx context.Context, api APIClient, workspaceID string, specs []secretSpec) ([]string, error) {
 	env := contextEnv(workspaceID)
 	for _, spec := range specs {
-		revealed, err := api.RevealSecretValueByName(ctx, workspaceID, spec.secretName)
+		revealed, err := api.RevealSecretValueByName(ctx, workspaceID, spec.secretName, "")
 		if err != nil {
 			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
 		}

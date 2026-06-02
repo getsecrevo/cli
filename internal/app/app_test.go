@@ -42,7 +42,7 @@ func (f fakeAPIClient) RevealSecretValue(_ context.Context, _ string, secretID s
 	}
 	return client.SecretValue{}, errors.New("unknown secret id")
 }
-func (f fakeAPIClient) RevealSecretValueByName(_ context.Context, _ string, name string) (client.SecretValue, error) {
+func (f fakeAPIClient) RevealSecretValueByName(_ context.Context, _ string, name, _ string) (client.SecretValue, error) {
 	switch name {
 	case "db-password":
 		return client.SecretValue{WorkspaceID: "workspace-1", SecretID: "secret-1", Value: "db-password-value"}, nil
@@ -65,9 +65,9 @@ func (t *trackingAPIClient) ListSecrets(ctx context.Context, ws string) (client.
 	return t.fakeAPIClient.ListSecrets(ctx, ws)
 }
 
-func (t *trackingAPIClient) RevealSecretValueByName(ctx context.Context, ws, name string) (client.SecretValue, error) {
+func (t *trackingAPIClient) RevealSecretValueByName(ctx context.Context, ws, name, version string) (client.SecretValue, error) {
 	t.byNameCalls = append(t.byNameCalls, name)
-	return t.fakeAPIClient.RevealSecretValueByName(ctx, ws, name)
+	return t.fakeAPIClient.RevealSecretValueByName(ctx, ws, name, version)
 }
 func (f fakeAPIClient) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
 	return client.AgentCreateResponse{Token: "token-1", Snippet: "export SECREVO_AGENT_TOKEN=token-1"}, nil
@@ -75,7 +75,7 @@ func (f fakeAPIClient) CreateAgent(context.Context, string, client.AgentCreateRe
 func (f fakeAPIClient) CreateSecret(context.Context, string, client.SecretCreateRequest) (client.Secret, error) {
 	return client.Secret{}, errors.New("fakeAPIClient does not support CreateSecret; use secretWritingFake")
 }
-func (f fakeAPIClient) RotateSecretValue(context.Context, string, string, string) error {
+func (f fakeAPIClient) RotateSecretValue(context.Context, string, string, string, string) error {
 	return errors.New("fakeAPIClient does not support RotateSecretValue; use secretWritingFake")
 }
 func (f fakeAPIClient) UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error) {
@@ -112,6 +112,7 @@ type updateCall struct {
 type rotateCall struct {
 	secretID string
 	value    string
+	grace    string
 }
 
 func (f *secretWritingFake) BaseURL() string { return "" }
@@ -130,7 +131,7 @@ func (f *secretWritingFake) GetSecret(context.Context, string, string) (client.S
 func (f *secretWritingFake) RevealSecretValue(context.Context, string, string) (client.SecretValue, error) {
 	return client.SecretValue{}, errors.New("not implemented")
 }
-func (f *secretWritingFake) RevealSecretValueByName(context.Context, string, string) (client.SecretValue, error) {
+func (f *secretWritingFake) RevealSecretValueByName(context.Context, string, string, string) (client.SecretValue, error) {
 	return client.SecretValue{}, errors.New("not implemented")
 }
 func (f *secretWritingFake) CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error) {
@@ -151,11 +152,11 @@ func (f *secretWritingFake) CreateSecret(_ context.Context, _ string, req client
 	f.existing = append(f.existing, created)
 	return created, nil
 }
-func (f *secretWritingFake) RotateSecretValue(_ context.Context, _ string, secretID string, value string) error {
+func (f *secretWritingFake) RotateSecretValue(_ context.Context, _ string, secretID, value, grace string) error {
 	if f.rotateErr != nil {
 		return f.rotateErr
 	}
-	f.rotateCalls = append(f.rotateCalls, rotateCall{secretID: secretID, value: value})
+	f.rotateCalls = append(f.rotateCalls, rotateCall{secretID: secretID, value: value, grace: grace})
 	return nil
 }
 func (f *secretWritingFake) DeleteSecret(_ context.Context, _ string, secretID string) error {
