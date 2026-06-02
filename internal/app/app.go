@@ -71,6 +71,10 @@ type Options struct {
 	// Tests inject a fake to assert reveal failures don't spawn ssh-agent;
 	// production leaves it nil so the APIClient is used directly.
 	SecretRevealer secretRevealer
+	// EnrollPoster overrides the HTTP edge used by `secrevo enroll`.
+	// Tests inject a fake backed by httptest; production leaves it nil so
+	// defaultEnrollPoster posts directly to /v1/enrollment/redeem.
+	EnrollPoster enrollPoster
 }
 
 func Execute(args []string, out, errOut io.Writer) error {
@@ -141,6 +145,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newExportCommand(opts))
 	root.AddCommand(newLoginCommand(opts))
 	root.AddCommand(newLogoutCommand(opts))
+	root.AddCommand(newEnrollCommand(opts))
 
 	return root
 }
