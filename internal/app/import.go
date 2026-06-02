@@ -27,7 +27,7 @@ file:
   cloudflare:
     secrevo:
       token: cf-token-xyz
-      account_id: 007761758105
+      account_id: 111122223333
 
 and ` + "`--prefix cf`" + `, the command creates two secrets:
 

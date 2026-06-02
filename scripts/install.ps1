@@ -1,7 +1,6 @@
 # secrevo CLI installer for Windows (PowerShell 5.1+).
 #
 # Usage:
-#   irm https://get.secrevo.com/cli.ps1 | iex
 #   irm https://github.com/getsecrevo/cli/releases/latest/download/install.ps1 | iex
 #
 # Env overrides:
