@@ -29,7 +29,7 @@ type apiSecretRevealer struct {
 }
 
 func (a apiSecretRevealer) RevealSecretValueByName(ctx context.Context, workspaceID, name string) (revealedValue, error) {
-	v, err := a.api.RevealSecretValueByName(ctx, workspaceID, name)
+	v, err := a.api.RevealSecretValueByName(ctx, workspaceID, name, "")
 	if err != nil {
 		return revealedValue{}, err
 	}

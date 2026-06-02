@@ -159,7 +159,7 @@ func runImport(cmd *cobra.Command, opts Options, path string) error {
 					skippedExisting++
 					continue
 				}
-				if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, leaf.value); err != nil {
+				if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, leaf.value, ""); err != nil {
 					return fmt.Errorf("rotate %s: %w", leaf.name, err)
 				}
 				rotated++
