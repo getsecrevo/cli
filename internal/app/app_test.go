@@ -79,6 +79,9 @@ func (f fakeAPIClient) RotateSecretValue(context.Context, string, string, string
 func (f fakeAPIClient) UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error) {
 	return client.Secret{}, errors.New("fakeAPIClient does not support UpdateSecret; use secretWritingFake")
 }
+func (f fakeAPIClient) DeleteSecret(context.Context, string, string) error {
+	return errors.New("fakeAPIClient does not support DeleteSecret; use secretWritingFake")
+}
 
 // secretWritingFake captures create/rotate calls so the secret-set/update
 // tests can assert exactly which path was taken. The list of pre-existing
@@ -88,9 +91,15 @@ type secretWritingFake struct {
 	createCalls []client.SecretCreateRequest
 	rotateCalls []rotateCall
 	updateCalls []updateCall
+	deleteCalls []deleteCall
 	rotateErr   error
 	createErr   error
 	updateErr   error
+	deleteErr   error
+}
+
+type deleteCall struct {
+	secretID string
 }
 
 type updateCall struct {
@@ -145,6 +154,20 @@ func (f *secretWritingFake) RotateSecretValue(_ context.Context, _ string, secre
 		return f.rotateErr
 	}
 	f.rotateCalls = append(f.rotateCalls, rotateCall{secretID: secretID, value: value})
+	return nil
+}
+func (f *secretWritingFake) DeleteSecret(_ context.Context, _ string, secretID string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleteCalls = append(f.deleteCalls, deleteCall{secretID: secretID})
+	kept := f.existing[:0]
+	for _, s := range f.existing {
+		if s.SecretID != secretID {
+			kept = append(kept, s)
+		}
+	}
+	f.existing = kept
 	return nil
 }
 func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID string, req client.SecretUpdateRequest) (client.Secret, error) {
@@ -850,5 +873,107 @@ func TestSecretGetResolvesByName(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "\"secret_id\": \"secret-1\"") {
 		t.Fatalf("output = %q, want secret JSON", out.String())
+	}
+}
+
+func TestSecretDeleteWithYesCallsDelete(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "delete", "OPENAI_API_KEY", "--yes"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.deleteCalls) != 1 {
+		t.Fatalf("deleteCalls = %d, want 1", len(fake.deleteCalls))
+	}
+	if got := fake.deleteCalls[0].secretID; got != "secret-7" {
+		t.Fatalf("deleted secretID = %q, want secret-7", got)
+	}
+	if !strings.Contains(out.String(), "Deleted secret \"OPENAI_API_KEY\"") {
+		t.Fatalf("output = %q, want deletion confirmation", out.String())
+	}
+}
+
+func TestSecretDeleteWithoutYesAndPipedStdinRefuses(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	// A bytes.Reader is not an *os.File so isInteractive returns false:
+	// the command must refuse rather than silently delete.
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		Stdin:         strings.NewReader("y\n"),
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "delete", "OPENAI_API_KEY"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "stdin is not a TTY") {
+		t.Fatalf("Execute() error = %v, want non-TTY refusal", err)
+	}
+	if len(fake.deleteCalls) != 0 {
+		t.Fatalf("deleteCalls = %d, want 0 (refused before API call)", len(fake.deleteCalls))
+	}
+}
+
+func TestSecretDeleteUnknownNameReturnsNotFound(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "delete", "DOES_NOT_EXIST", "--yes"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "secret not found") {
+		t.Fatalf("Execute() error = %v, want not-found", err)
+	}
+	if len(fake.deleteCalls) != 0 {
+		t.Fatalf("deleteCalls = %d, want 0 (resolve failed before API call)", len(fake.deleteCalls))
+	}
+}
+
+func TestSecretDeletePropagatesAPIError(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "OPENAI_API_KEY", Status: "active"},
+		},
+		deleteErr: errors.New("boom"),
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "delete", "OPENAI_API_KEY", "--yes"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("Execute() error = %v, want API error", err)
 	}
 }
