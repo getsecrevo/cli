@@ -7,6 +7,14 @@
 // written with the inherited ACL — operators concerned about that should
 // keep `%APPDATA%` private to their account (which is the default).
 //
+// On Windows the JSON payload is additionally wrapped with DPAPI
+// (`CryptProtectData`, scope `CurrentUser`) so a different user profile
+// on the same machine cannot decrypt the file even if they can read it.
+// The on-disk layout in that case is the literal 8-byte magic header
+// `SECREVO\x01` followed by the DPAPI ciphertext. Files written by
+// previous versions of the CLI (plain JSON, no header) load unchanged
+// and are transparently re-encrypted on the next Save.
+//
 // Discovery order, top-to-bottom:
 //  1. “SECREVO_CONFIG_HOME/credentials.json“ if SECREVO_CONFIG_HOME is set.
 //  2. “$XDG_CONFIG_HOME/secrevo/credentials.json“ on POSIX.
@@ -15,6 +23,7 @@
 package credentials
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +36,10 @@ import (
 // ErrNotFound is returned by Load when the credentials file does not exist.
 // Callers should treat this as "no stored login" rather than an actual error.
 var ErrNotFound = errors.New("credentials file does not exist")
+
+// magic is the 8-byte header that prefixes a DPAPI-wrapped payload on
+// Windows. Files lacking this header are treated as legacy plain JSON.
+var magic = []byte{'S', 'E', 'C', 'R', 'E', 'V', 'O', 0x01}
 
 // File is the on-disk representation.
 type File struct {
@@ -62,6 +75,11 @@ func DefaultPath() (string, error) {
 
 // Load reads the credentials file from “path“. If the file does not
 // exist, returns ErrNotFound; the caller decides whether that is fatal.
+//
+// On Windows, files starting with the SECREVO\x01 magic header are
+// DPAPI-unprotected before JSON parsing. Files without the header (or
+// shorter than the header) are treated as legacy plain JSON; the next
+// Save call will write them back wrapped.
 func Load(path string) (File, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -70,8 +88,16 @@ func Load(path string) (File, error) {
 		}
 		return File{}, fmt.Errorf("read %s: %w", path, err)
 	}
+	payload := data
+	if len(data) >= len(magic) && bytes.Equal(data[:len(magic)], magic) {
+		plain, err := unprotect(data[len(magic):])
+		if err != nil {
+			return File{}, fmt.Errorf("unprotect %s: %w", path, err)
+		}
+		payload = plain
+	}
 	var f File
-	if err := json.Unmarshal(data, &f); err != nil {
+	if err := json.Unmarshal(payload, &f); err != nil {
 		return File{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if f.Version != 1 {
@@ -82,6 +108,10 @@ func Load(path string) (File, error) {
 
 // Save writes the credentials file with mode 0600 (POSIX). Parent
 // directories are created as needed.
+//
+// On Windows the JSON payload is wrapped with DPAPI (scope CurrentUser)
+// and prefixed with the SECREVO\x01 magic header before being written
+// to disk. On POSIX the file is plain JSON.
 func Save(path string, f File) error {
 	f.Version = 1
 	if strings.TrimSpace(f.Token) == "" {
@@ -90,12 +120,25 @@ func Save(path string, f File) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
-	data, err := json.MarshalIndent(f, "", "  ")
+	payload, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
+	ciphertext, wrapped, err := protect(payload)
+	if err != nil {
+		return fmt.Errorf("protect credentials: %w", err)
+	}
+	var body []byte
+	if wrapped {
+		body = make([]byte, 0, len(magic)+len(ciphertext))
+		body = append(body, magic...)
+		body = append(body, ciphertext...)
+	} else {
+		// POSIX identity path: emit plain JSON.
+		body = ciphertext
+	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
