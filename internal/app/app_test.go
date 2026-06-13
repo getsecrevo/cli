@@ -192,6 +192,9 @@ func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID s
 			if req.Status != nil {
 				f.existing[i].Status = *req.Status
 			}
+			if req.Tags != nil {
+				f.existing[i].Tags = append([]string(nil), (*req.Tags)...)
+			}
 			return f.existing[i], nil
 		}
 	}
@@ -978,6 +981,179 @@ func TestSecretDeletePropagatesAPIError(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("Execute() error = %v, want API error", err)
+	}
+}
+
+func TestSecretEditPatchesOnlyGivenField(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{
+				WorkspaceID:              "workspace-1",
+				SecretID:                 "secret-7",
+				Name:                     "DB_PASSWORD",
+				Description:              "primary db",
+				RegenerationInstructions: "old notes",
+				Status:                   "active",
+				Tags:                     []string{"prod"},
+			},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "edit", "DB_PASSWORD", "--regeneration-instructions", "rotate in RDS console"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.rotateCalls) != 0 {
+		t.Fatalf("rotateCalls = %d, want 0 (edit must never rotate the value)", len(fake.rotateCalls))
+	}
+	if len(fake.updateCalls) != 1 {
+		t.Fatalf("updateCalls = %d, want 1", len(fake.updateCalls))
+	}
+	req := fake.updateCalls[0].req
+	if req.RegenerationInstructions == nil || *req.RegenerationInstructions != "rotate in RDS console" {
+		t.Fatalf("RegenerationInstructions = %v, want pointer to %q", req.RegenerationInstructions, "rotate in RDS console")
+	}
+	// Every other field must stay nil so the server leaves it untouched.
+	if req.Name != nil || req.Description != nil || req.Status != nil || req.Tags != nil {
+		t.Fatalf("partial patch leaked other fields: %+v", req)
+	}
+	if got := fake.existing[0].Description; got != "primary db" {
+		t.Fatalf("description mutated to %q, want untouched", got)
+	}
+}
+
+func TestSecretEditRegenerationFromStdinPreservesMultiline(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "DB_PASSWORD", Status: "active"},
+		},
+	}
+	runbook := "Step 1: foo\nStep 2: bar\nStep 3: baz"
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		Stdin:         strings.NewReader(runbook + "\n"),
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "edit", "DB_PASSWORD", "--regeneration-instructions-file", "-"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.updateCalls) != 1 {
+		t.Fatalf("updateCalls = %d, want 1", len(fake.updateCalls))
+	}
+	req := fake.updateCalls[0].req
+	if req.RegenerationInstructions == nil || *req.RegenerationInstructions != runbook {
+		t.Fatalf("RegenerationInstructions = %v, want multi-line %q", req.RegenerationInstructions, runbook)
+	}
+}
+
+func TestSecretEditTagsReplaceSet(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "STRIPE_KEY", Status: "active", Tags: []string{"old"}},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "edit", "STRIPE_KEY", "--tag", "billing", "--tag", "prod"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	req := fake.updateCalls[0].req
+	if req.Tags == nil || len(*req.Tags) != 2 || (*req.Tags)[0] != "billing" || (*req.Tags)[1] != "prod" {
+		t.Fatalf("Tags = %v, want [billing prod]", req.Tags)
+	}
+}
+
+func TestSecretEditClearTags(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "STRIPE_KEY", Status: "active", Tags: []string{"old"}},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "edit", "STRIPE_KEY", "--clear-tags"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	req := fake.updateCalls[0].req
+	if req.Tags == nil || len(*req.Tags) != 0 {
+		t.Fatalf("Tags = %v, want non-nil empty slice (clear)", req.Tags)
+	}
+}
+
+func TestSecretEditWithNoFlagsErrors(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "DB_PASSWORD", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "edit", "DB_PASSWORD"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "nothing to edit") {
+		t.Fatalf("Execute() error = %v, want nothing-to-edit", err)
+	}
+	if len(fake.updateCalls) != 0 {
+		t.Fatalf("updateCalls = %d, want 0 (no API call when nothing to edit)", len(fake.updateCalls))
+	}
+}
+
+func TestSecretSetOnExistingRejectsMetadataFlags(t *testing.T) {
+	var out bytes.Buffer
+	fake := &secretWritingFake{
+		existing: []client.Secret{
+			{WorkspaceID: "workspace-1", SecretID: "secret-7", Name: "DB_PASSWORD", Status: "active"},
+		},
+	}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "set", "DB_PASSWORD", "--value", "new-secret", "--regeneration-instructions", "X"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "apply only when creating") {
+		t.Fatalf("Execute() error = %v, want explicit rejection (not a silent no-op)", err)
+	}
+	if len(fake.rotateCalls) != 0 {
+		t.Fatalf("rotateCalls = %d, want 0 (must fail before rotating)", len(fake.rotateCalls))
+	}
+	if !strings.Contains(err.Error(), "secrevo secret edit") {
+		t.Fatalf("error should point at `secret edit`; got %v", err)
 	}
 }
 
