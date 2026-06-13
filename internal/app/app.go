@@ -257,6 +257,7 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretSetCommand(opts))
 	secret.AddCommand(newSecretUpdateCommand(opts))
 	secret.AddCommand(newSecretRenameCommand(opts))
+	secret.AddCommand(newSecretEditCommand(opts))
 	secret.AddCommand(newSecretDeleteCommand(opts))
 	secret.AddCommand(newSecretRevealCommand(opts))
 	return secret
@@ -582,6 +583,143 @@ Examples:
 	return cmd
 }
 
+func newSecretEditCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "edit <secret-name>",
+		Short: "Edit a secret's metadata without touching its value",
+		Long: `Edit the metadata of an existing secret. The stored value is NEVER
+read, written, or rotated — this issues a metadata-only PATCH, so the
+audit log records ` + "`secret.updated`" + ` and not a value rotation.
+
+Only the fields you pass are changed; omitted fields are left exactly as
+they were (true partial update). Pass at least one of:
+
+  --description "..."
+  --regeneration-instructions "..."        inline text
+  --regeneration-instructions-file PATH    read the text from a file (use
+                                            '-' to read from stdin), for
+                                            multi-line runbooks
+  --tag LABEL                               repeatable; REPLACES the entire
+                                            tag set (pass --tag with no value
+                                            via --clear-tags to remove all)
+  --clear-tags                              remove every tag
+  --status active|rotating|archived
+
+Examples:
+
+  secrevo secret edit OPENAI_API_KEY --regeneration-instructions "Rotate in the OpenAI dashboard, then secrevo secret set"
+  secrevo secret edit DB_PASSWORD --regeneration-instructions-file ./runbooks/db-rotation.md
+  cat runbook.md | secrevo secret edit DB_PASSWORD --regeneration-instructions-file -
+  secrevo secret edit STRIPE_KEY --tag billing --tag prod
+  secrevo secret edit OLD_KEY --status archived
+`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretEdit(cmd, opts, args[0])
+		},
+	}
+	cmd.Flags().String("description", "", "Set the secret's description")
+	cmd.Flags().String("regeneration-instructions", "", "Set the rotation notes (inline text)")
+	cmd.Flags().String("regeneration-instructions-file", "", "Read the rotation notes from a file path ('-' for stdin)")
+	cmd.Flags().StringArray("tag", nil, "Set a tag; repeat for multiple. Replaces the entire existing tag set")
+	cmd.Flags().Bool("clear-tags", false, "Remove all tags from the secret")
+	cmd.Flags().String("status", "", "Set the lifecycle status: active, rotating, or archived")
+	return cmd
+}
+
+func runSecretEdit(cmd *cobra.Command, opts Options, name string) error {
+	workspaceID, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+
+	var req client.SecretUpdateRequest
+
+	if cmd.Flags().Changed("description") {
+		v, _ := cmd.Flags().GetString("description")
+		req.Description = &v
+	}
+
+	inlineRegen := cmd.Flags().Changed("regeneration-instructions")
+	fileRegen := cmd.Flags().Changed("regeneration-instructions-file")
+	if inlineRegen && fileRegen {
+		return fmt.Errorf("--regeneration-instructions and --regeneration-instructions-file are mutually exclusive")
+	}
+	if inlineRegen {
+		v, _ := cmd.Flags().GetString("regeneration-instructions")
+		req.RegenerationInstructions = &v
+	}
+	if fileRegen {
+		path, _ := cmd.Flags().GetString("regeneration-instructions-file")
+		text, err := readRegenerationFile(cmd, opts, path)
+		if err != nil {
+			return err
+		}
+		req.RegenerationInstructions = &text
+	}
+
+	if cmd.Flags().Changed("status") {
+		v, _ := cmd.Flags().GetString("status")
+		req.Status = &v
+	}
+
+	tagsChanged := cmd.Flags().Changed("tag")
+	clearTags, _ := cmd.Flags().GetBool("clear-tags")
+	if tagsChanged && clearTags {
+		return fmt.Errorf("--tag and --clear-tags are mutually exclusive")
+	}
+	if clearTags {
+		empty := []string{}
+		req.Tags = &empty
+	} else if tagsChanged {
+		tags, _ := cmd.Flags().GetStringArray("tag")
+		req.Tags = &tags
+	}
+
+	if req.Description == nil && req.RegenerationInstructions == nil && req.Status == nil && req.Tags == nil {
+		return fmt.Errorf("nothing to edit: pass at least one of --description, --regeneration-instructions[-file], --tag/--clear-tags, or --status")
+	}
+
+	return withClient(opts, func(api APIClient) error {
+		list, err := api.ListSecrets(cmd.Context(), workspaceID)
+		if err != nil {
+			return fmt.Errorf("list secrets: %w", err)
+		}
+		secretID, err := resolveSecretID(list.Secrets, name)
+		if err != nil {
+			return err
+		}
+		updated, err := api.UpdateSecret(cmd.Context(), workspaceID, secretID, req)
+		if err != nil {
+			return fmt.Errorf("edit secret %q: %w", name, err)
+		}
+		_, _ = fmt.Fprintf(opts.Out, "Updated metadata for secret %q (%s) in workspace %s\n", updated.Name, updated.SecretID, workspaceID)
+		return nil
+	})
+}
+
+// readRegenerationFile reads rotation notes from a file path, or from stdin
+// when path is "-". The content is taken verbatim except for a trailing
+// newline strip, so multi-line runbooks survive intact.
+func readRegenerationFile(cmd *cobra.Command, opts Options, path string) (string, error) {
+	if path == "-" {
+		stdin := opts.Stdin
+		if stdin == nil {
+			stdin = os.Stdin
+		}
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read stdin: %w", err)
+		}
+		return strings.TrimRight(string(data), "\r\n"), nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	return strings.TrimRight(string(data), "\r\n"), nil
+}
+
 func newSecretSetCommand(opts Options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "set <secret-name>",
@@ -590,7 +728,9 @@ func newSecretSetCommand(opts Options) *cobra.Command {
 
 If the secret name does not exist in the workspace, it is created with
 the supplied value (and optional --description). If it already exists,
-its value is rotated; metadata is left untouched.
+its value is rotated and metadata is left untouched — passing
+--description or --regeneration-instructions on a rotation is rejected
+with an error (use ` + "`secrevo secret edit`" + ` to change metadata only).
 
 Use --update-only to refuse creating a new secret (useful in rotation
 scripts that should fail loud if the secret was deleted). Use
@@ -615,8 +755,8 @@ Examples:
 	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
 	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
 	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
-	cmd.Flags().String("description", "", "Optional description (used only when creating)")
-	cmd.Flags().String("regeneration-instructions", "", "Optional notes on how to rotate this secret (used only when creating)")
+	cmd.Flags().String("description", "", "Description, applied only when creating; on an existing secret this errors — use `secret edit` instead")
+	cmd.Flags().String("regeneration-instructions", "", "Rotation notes, applied only when creating; on an existing secret this errors — use `secret edit` instead")
 	cmd.Flags().Bool("update-only", false, "Refuse to create the secret if it does not exist")
 	cmd.Flags().Bool("create-only", false, "Refuse to rotate the secret if it already exists")
 	cmd.Flags().String("grace", "", "On rotation, keep the previous value retrievable via `secret reveal --version previous` for this duration (e.g. 30m, 2h, 24h). Format: <int><h|m|s>, range 1m..168h. Errors if the secret does not yet exist (no rotation happens on creation).")
@@ -688,6 +828,17 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 		if existing != nil {
 			if createOnly {
 				return fmt.Errorf("secret %q already exists in workspace %q", name, workspaceID)
+			}
+			// --description / --regeneration-instructions only apply when
+			// creating. On a rotation they would be silently discarded, so
+			// fail loud and point at the metadata-only command instead of
+			// pretending the metadata was saved.
+			if cmd.Flags().Changed("description") || cmd.Flags().Changed("regeneration-instructions") {
+				return fmt.Errorf(
+					"--description and --regeneration-instructions apply only when creating a secret; %q already exists. "+
+						"To rotate its value, drop those flags; to change its metadata without rotating, use `secrevo secret edit %s`.",
+					name, name,
+				)
 			}
 			if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, value, grace); err != nil {
 				return fmt.Errorf("rotate secret value: %w", err)

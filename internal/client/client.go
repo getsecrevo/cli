@@ -119,6 +119,10 @@ type SecretUpdateRequest struct {
 	Description              *string `json:"description,omitempty"`
 	RegenerationInstructions *string `json:"regeneration_instructions,omitempty"`
 	Status                   *string `json:"status,omitempty"`
+	// Tags replaces the entire tag set when non-nil (the server applies
+	// set-semantics, not merge). A non-nil pointer to an empty slice clears
+	// all tags; a nil pointer leaves them untouched.
+	Tags *[]string `json:"tags,omitempty"`
 }
 
 type AgentCreateResponse struct {
