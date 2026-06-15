@@ -372,6 +372,52 @@ func TestRunReportsUnknownSecretWithName(t *testing.T) {
 	}
 }
 
+// forbiddenRevealClient returns the api's 403 missing-capability shape from
+// every by-name reveal, mimicking a human who holds secret.read but not
+// secret.reveal after the human-reveal split.
+type forbiddenRevealClient struct{ fakeAPIClient }
+
+func (forbiddenRevealClient) RevealSecretValueByName(context.Context, string, string, string) (client.SecretValue, error) {
+	return client.SecretValue{}, errors.New(`api returned 403 Forbidden: {"error":"forbidden","message":"missing required capability"}`)
+}
+
+func TestIsForbiddenMatchesApi403Only(t *testing.T) {
+	if !isForbidden(errors.New(`api returned 403 Forbidden: {"error":"forbidden"}`)) {
+		t.Fatal("expected a 403 forbidden body to be recognized")
+	}
+	if isForbidden(errors.New("api returned 404 Not Found: not_found")) {
+		t.Fatal("a 404 must not be treated as forbidden")
+	}
+	if isForbidden(nil) {
+		t.Fatal("nil must not be forbidden")
+	}
+}
+
+func TestSecretGetForbiddenSuggestsRevealCapability(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		ClientFactory: func() (APIClient, error) {
+			return forbiddenRevealClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"secret", "reveal", "db-password", "--allow-stdout"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected an error when reveal is forbidden")
+	}
+	if !strings.Contains(err.Error(), "secret.reveal") {
+		t.Fatalf("error should name the secret.reveal capability; got: %v", err)
+	}
+	// The raw 403 status line must not be the whole story — the hint replaces it.
+	if !strings.Contains(err.Error(), "agent-only") {
+		t.Fatalf("error should explain agent-only access; got: %v", err)
+	}
+}
+
 func TestRunUsesByNameRevealAndSkipsListSecrets(t *testing.T) {
 	var out bytes.Buffer
 	runner := &recordingRunner{}
