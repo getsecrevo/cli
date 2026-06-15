@@ -344,6 +344,16 @@ func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
 					name,
 				)
 			}
+			if isForbidden(err) {
+				return fmt.Errorf(
+					"Not allowed to reveal %q to yourself.\n"+
+						"  Displaying a secret's plaintext to a human requires the \"secret.reveal\" capability.\n"+
+						"  This access may be agent-only: an agent token can still consume the value at runtime\n"+
+						"  (e.g. via `secrevo run`), but human reveal is withheld. Ask a workspace admin to grant\n"+
+						"  you \"secret.reveal\" on this secret.",
+					name,
+				)
+			}
 			return fmt.Errorf("reveal secret %q: %w", name, err)
 		}
 		if toFile != "" {
@@ -377,6 +387,19 @@ func isNotFoundPrevious(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "404") && strings.Contains(msg, "not_found_previous")
+}
+
+// isForbidden recognizes the api's 403 missing-capability response. The client
+// wraps the HTTP status and body verbatim ("api returned 403 Forbidden: ...
+// forbidden ..."), so a human reveal blocked for lack of secret.reveal lands
+// here and the caller can print an actionable, capability-specific hint instead
+// of the raw status line.
+func isForbidden(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "403") && strings.Contains(msg, "forbidden")
 }
 
 // writeSecretToFile materializes a revealed value at path with restrictive
@@ -1197,6 +1220,9 @@ func buildInjectedEnvFromList(ctx context.Context, api APIClient, workspaceID st
 		}
 		revealed, err := api.RevealSecretValue(ctx, workspaceID, secretID)
 		if err != nil {
+			if isForbidden(err) {
+				return nil, forbiddenRunError(spec.secretName, err)
+			}
 			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
 		}
 		env = append(env, spec.envName+"="+revealed.Value)
@@ -1212,11 +1238,29 @@ func buildInjectedEnvByName(ctx context.Context, api APIClient, workspaceID stri
 	for _, spec := range specs {
 		revealed, err := api.RevealSecretValueByName(ctx, workspaceID, spec.secretName, "")
 		if err != nil {
+			if isForbidden(err) {
+				return nil, forbiddenRunError(spec.secretName, err)
+			}
 			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
 		}
 		env = append(env, spec.envName+"="+revealed.Value)
 	}
 	return env, nil
+}
+
+// forbiddenRunError explains a 403 during `secrevo run`. A run authenticated
+// with a HUMAN token needs secret.reveal (it would otherwise be a back-door to
+// display the value); the intended runtime path is an AGENT token, which uses
+// secret.read. Surfacing this distinction turns an opaque 403 into a fix.
+func forbiddenRunError(secretName string, err error) error {
+	return fmt.Errorf(
+		"reveal secret %q: not authorized to inject this value.\n"+
+			"  Runtime injection with an agent token requires \"secret.read\" on the secret;\n"+
+			"  a human token additionally requires \"secret.reveal\". If this is meant to run\n"+
+			"  unattended, use an agent token in SECREVO_API_TOKEN. Otherwise ask a workspace\n"+
+			"  admin to grant the missing capability. (%w)",
+		secretName, err,
+	)
 }
 
 func contextEnv(workspaceID string) []string {
