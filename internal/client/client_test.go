@@ -87,6 +87,39 @@ func TestRevealSecretValueHitsValueEndpoint(t *testing.T) {
 	}
 }
 
+func TestProxyConsumeHitsProxyEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/workspaces/ws-1/secrets/by-name/OPENAI/proxy" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		var req ProxyRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.URL != "https://api.openai.com/v1/models" || req.Headers["Authorization"] != "Bearer {{secret}}" {
+			t.Fatalf("unexpected proxy request %#v", req)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true})
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(Config{BaseURL: server.URL, Token: "t", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	got, err := c.ProxyConsume(context.Background(), "ws-1", "OPENAI", ProxyRequest{
+		Method: "GET", URL: "https://api.openai.com/v1/models", Headers: map[string]string{"Authorization": "Bearer {{secret}}"},
+	})
+	if err != nil {
+		t.Fatalf("ProxyConsume() error = %v", err)
+	}
+	if got.Status != 200 || !got.Projected || got.Body != `{"ok":1}` {
+		t.Fatalf("unexpected response %#v", got)
+	}
+}
+
 func TestBootstrapWorkspaceSendsRequestBody(t *testing.T) {
 	t.Helper()
 
