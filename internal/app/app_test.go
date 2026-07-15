@@ -84,6 +84,18 @@ func (f fakeAPIClient) UpdateSecret(context.Context, string, string, client.Secr
 func (f fakeAPIClient) DeleteSecret(context.Context, string, string) error {
 	return errors.New("fakeAPIClient does not support DeleteSecret; use secretWritingFake")
 }
+func (f fakeAPIClient) ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
+	return client.ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true}, nil
+}
+func (f fakeAPIClient) ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error) {
+	return nil, nil
+}
+func (f fakeAPIClient) PutProxyTarget(_ context.Context, _ string, _ string, t client.ProxyTarget) (client.ProxyTarget, error) {
+	return t, nil
+}
+func (f fakeAPIClient) DeleteProxyTarget(context.Context, string, string, string) error {
+	return nil
+}
 
 // secretWritingFake captures create/rotate calls so the secret-set/update
 // tests can assert exactly which path was taken. The list of pre-existing
@@ -173,6 +185,18 @@ func (f *secretWritingFake) DeleteSecret(_ context.Context, _ string, secretID s
 	f.existing = kept
 	return nil
 }
+func (f *secretWritingFake) ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
+	return client.ProxyResponse{}, errors.New("secretWritingFake does not support ProxyConsume")
+}
+func (f *secretWritingFake) ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error) {
+	return nil, nil
+}
+func (f *secretWritingFake) PutProxyTarget(_ context.Context, _ string, _ string, t client.ProxyTarget) (client.ProxyTarget, error) {
+	return t, nil
+}
+func (f *secretWritingFake) DeleteProxyTarget(context.Context, string, string, string) error {
+	return nil
+}
 func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID string, req client.SecretUpdateRequest) (client.Secret, error) {
 	if f.updateErr != nil {
 		return client.Secret{}, f.updateErr
@@ -246,6 +270,30 @@ func TestVersionDoesNotRequireClient(t *testing.T) {
 	}
 	if got := strings.TrimSpace(out.String()); got != "1.2.3" {
 		t.Fatalf("output = %q, want 1.2.3", got)
+	}
+}
+
+func TestCallCommandPrintsResponseNeverValue(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		ClientFactory: func() (APIClient, error) {
+			return fakeAPIClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"call", "--secret", "OPENAI", "--url", "https://api.openai.com/v1/models", "-H", "Authorization: Bearer {{secret}}"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, `"status": 200`) || !strings.Contains(got, `ok`) || !strings.Contains(got, `"projected": true`) {
+		t.Fatalf("call output missing mediated response: %q", got)
+	}
+	// The command prints only the response; the placeholder/value must not leak.
+	if strings.Contains(got, "{{secret}}") {
+		t.Fatalf("call output leaked the placeholder: %q", got)
 	}
 }
 

@@ -45,6 +45,10 @@ type APIClient interface {
 	UpdateSecret(context.Context, string, string, client.SecretUpdateRequest) (client.Secret, error)
 	DeleteSecret(context.Context, string, string) error
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
+	ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error)
+	ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error)
+	PutProxyTarget(context.Context, string, string, client.ProxyTarget) (client.ProxyTarget, error)
+	DeleteProxyTarget(context.Context, string, string, string) error
 }
 
 type Options struct {
@@ -147,6 +151,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newSecretCommand(opts))
 	root.AddCommand(newAgentCommand(opts))
 	root.AddCommand(newRunCommand(opts))
+	root.AddCommand(newCallCommand(opts))
 	root.AddCommand(newSSHRunCommand(opts))
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))
@@ -260,6 +265,7 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretEditCommand(opts))
 	secret.AddCommand(newSecretDeleteCommand(opts))
 	secret.AddCommand(newSecretRevealCommand(opts))
+	secret.AddCommand(newSecretProxyTargetCommand(opts))
 	return secret
 }
 
