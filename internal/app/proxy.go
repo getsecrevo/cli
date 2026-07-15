@@ -27,12 +27,28 @@ func newCallCommand(opts Options) *cobra.Command {
 	}
 	cmd.Flags().StringP("secret", "s", "", "secret name to consume (required)")
 	cmd.Flags().StringP("method", "X", "GET", "HTTP method")
-	cmd.Flags().StringP("url", "u", "", "absolute https URL of the allowlisted destination (required)")
+	cmd.Flags().StringP("url", "u", "", "absolute https URL of the allowlisted destination")
+	cmd.Flags().String("provider", "", "typed provider (openai|anthropic|stripe|github): fills host + auth header, use with --path")
+	cmd.Flags().String("path", "", "path for --provider mode, e.g. /v1/models")
 	cmd.Flags().StringArrayP("header", "H", nil, "header 'Key: Value'; use {{secret}} for the value")
 	cmd.Flags().StringP("body", "d", "", "request body, or @file to read from a file; may contain {{secret}}")
 	_ = cmd.MarkFlagRequired("secret")
-	_ = cmd.MarkFlagRequired("url")
 	return cmd
+}
+
+// typedProvider hardcodes a provider's host + auth header template so the caller
+// supplies only a path — the host is implicitly the allowlist boundary and the
+// value goes only into the fixed auth header. Mirrors mcp-server typed proxies.
+type typedProvider struct {
+	host    string
+	headers map[string]string
+}
+
+var typedProviders = map[string]typedProvider{
+	"openai":    {host: "api.openai.com", headers: map[string]string{"Authorization": "Bearer {{secret}}"}},
+	"anthropic": {host: "api.anthropic.com", headers: map[string]string{"x-api-key": "{{secret}}", "anthropic-version": "2023-06-01"}},
+	"stripe":    {host: "api.stripe.com", headers: map[string]string{"Authorization": "Bearer {{secret}}"}},
+	"github":    {host: "api.github.com", headers: map[string]string{"Authorization": "Bearer {{secret}}", "Accept": "application/vnd.github+json"}},
 }
 
 func runCall(cmd *cobra.Command, opts Options) error {
@@ -43,12 +59,39 @@ func runCall(cmd *cobra.Command, opts Options) error {
 	secret, _ := cmd.Flags().GetString("secret")
 	method, _ := cmd.Flags().GetString("method")
 	rawURL, _ := cmd.Flags().GetString("url")
+	provider, _ := cmd.Flags().GetString("provider")
+	path, _ := cmd.Flags().GetString("path")
 	headerArgs, _ := cmd.Flags().GetStringArray("header")
 	bodyArg, _ := cmd.Flags().GetString("body")
 
 	headers, err := parseHeaders(headerArgs)
 	if err != nil {
 		return err
+	}
+	if provider != "" {
+		if rawURL != "" {
+			return fmt.Errorf("--provider and --url are mutually exclusive")
+		}
+		p, ok := typedProviders[provider]
+		if !ok {
+			return fmt.Errorf("unknown --provider %q (openai|anthropic|stripe|github)", provider)
+		}
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("--provider mode requires --path starting with '/', e.g. /v1/models")
+		}
+		rawURL = "https://" + p.host + path
+		// Provider auth headers fill in unless the caller overrode the same key.
+		merged := make(map[string]string, len(p.headers)+len(headers))
+		for k, v := range p.headers {
+			merged[k] = v
+		}
+		for k, v := range headers {
+			merged[k] = v
+		}
+		headers = merged
+	}
+	if rawURL == "" {
+		return fmt.Errorf("provide --url, or --provider with --path")
 	}
 	body, err := resolveBody(bodyArg)
 	if err != nil {

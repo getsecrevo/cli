@@ -297,6 +297,41 @@ func TestCallCommandPrintsResponseNeverValue(t *testing.T) {
 	}
 }
 
+// capturingProxyFake records the ProxyConsume request so provider-mode tests
+// can assert the built URL/headers. Embeds fakeAPIClient for the rest.
+type capturingProxyFake struct {
+	fakeAPIClient
+	gotWS, gotSecret string
+	gotReq           client.ProxyRequest
+}
+
+func (f *capturingProxyFake) ProxyConsume(_ context.Context, ws, name string, req client.ProxyRequest) (client.ProxyResponse, error) {
+	f.gotWS, f.gotSecret, f.gotReq = ws, name, req
+	return client.ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true}, nil
+}
+
+func TestCallProviderBuildsTypedRequest(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingProxyFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"call", "--secret", "OPENAI", "--provider", "openai", "--path", "/v1/models"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.gotSecret != "OPENAI" {
+		t.Fatalf("secret = %q", fake.gotSecret)
+	}
+	if fake.gotReq.URL != "https://api.openai.com/v1/models" {
+		t.Fatalf("provider URL = %q", fake.gotReq.URL)
+	}
+	if fake.gotReq.Headers["Authorization"] != "Bearer {{secret}}" {
+		t.Fatalf("provider auth header = %q", fake.gotReq.Headers["Authorization"])
+	}
+}
+
 func TestRunRequiresConfiguredClient(t *testing.T) {
 	var out bytes.Buffer
 	cmd := NewRootCommand(Options{
