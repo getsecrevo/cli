@@ -243,6 +243,71 @@ func (c *Client) RevealSecretValueByName(ctx context.Context, workspaceID, name,
 	return out, nil
 }
 
+// ProxyRequest is a mediated outbound call: the server injects the secret into
+// this request against an allowlisted host and returns only the response. Use
+// "{{secret}}" in Headers/Body where the value goes (never in URL).
+type ProxyRequest struct {
+	Method  string            `json:"method,omitempty"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
+}
+
+// ProxyResponse is the (projected or redacted) upstream response — never the value.
+type ProxyResponse struct {
+	Status    int               `json:"status"`
+	Headers   map[string]string `json:"headers"`
+	Body      string            `json:"body"`
+	Truncated bool              `json:"truncated"`
+	Projected bool              `json:"projected"`
+}
+
+// ProxyConsume has the server use the named secret in a mediated call and return
+// only the response. The plaintext value never reaches this process.
+func (c *Client) ProxyConsume(ctx context.Context, workspaceID, name string, req ProxyRequest) (ProxyResponse, error) {
+	var out ProxyResponse
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/proxy", url.PathEscape(workspaceID), url.PathEscape(name))
+	err := c.doJSON(ctx, http.MethodPost, path, req, &out)
+	return out, err
+}
+
+// ProxyTarget is one allowlisted operation for a secret's mediated proxy.
+type ProxyTarget struct {
+	Host             string            `json:"host"`
+	Methods          []string          `json:"methods"`
+	PathPrefixes     []string          `json:"path_prefixes"`
+	AllowedQuery     []string          `json:"allowed_query,omitempty"`
+	QueryConstraints map[string]string `json:"query_constraints,omitempty"`
+	BodyTemplate     string            `json:"body_template,omitempty"`
+	ResponseMode     string            `json:"response_mode,omitempty"`
+	ResponseFields   []string          `json:"response_fields,omitempty"`
+	MaxResponseBytes int64             `json:"max_response_bytes,omitempty"`
+}
+
+// ListProxyTargets returns a secret's mediated-proxy allowlist (human session).
+func (c *Client) ListProxyTargets(ctx context.Context, workspaceID, secretID string) ([]ProxyTarget, error) {
+	var out struct {
+		Targets []ProxyTarget `json:"targets"`
+	}
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/proxy-targets", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out.Targets, err
+}
+
+// PutProxyTarget upserts one allowlist target (human session; secret.write).
+func (c *Client) PutProxyTarget(ctx context.Context, workspaceID, secretID string, t ProxyTarget) (ProxyTarget, error) {
+	var out ProxyTarget
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/proxy-targets", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodPut, path, t, &out)
+	return out, err
+}
+
+// DeleteProxyTarget removes one allowlist target by host (human session).
+func (c *Client) DeleteProxyTarget(ctx context.Context, workspaceID, secretID, host string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/proxy-targets?host=%s", url.PathEscape(workspaceID), url.PathEscape(secretID), url.QueryEscape(host))
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
 func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretListResponse, error) {
 	var out SecretListResponse
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets", url.PathEscape(workspaceID))
