@@ -46,6 +46,9 @@ type APIClient interface {
 	DeleteSecret(context.Context, string, string) error
 	CreateAgent(context.Context, string, client.AgentCreateRequest) (client.AgentCreateResponse, error)
 	ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error)
+	OpenProxySession(context.Context, string, string) (client.ProxySession, error)
+	ProxySessionConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error)
+	CloseProxySession(context.Context, string, string) error
 	ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error)
 	PutProxyTarget(context.Context, string, string, client.ProxyTarget) (client.ProxyTarget, error)
 	DeleteProxyTarget(context.Context, string, string, string) error
@@ -152,6 +155,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newAgentCommand(opts))
 	root.AddCommand(newRunCommand(opts))
 	root.AddCommand(newCallCommand(opts))
+	root.AddCommand(newSessionCommand(opts))
 	root.AddCommand(newSSHRunCommand(opts))
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))

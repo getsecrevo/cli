@@ -25,14 +25,14 @@ func newCallCommand(opts Options) *cobra.Command {
 			return runCall(cmd, opts)
 		},
 	}
-	cmd.Flags().StringP("secret", "s", "", "secret name to consume (required)")
+	cmd.Flags().StringP("secret", "s", "", "secret name to consume (required unless --session)")
+	cmd.Flags().String("session", "", "issue this call inside an open proxy-session (from `secrevo session open`); the session binds the secret")
 	cmd.Flags().StringP("method", "X", "GET", "HTTP method")
 	cmd.Flags().StringP("url", "u", "", "absolute https URL of the allowlisted destination")
 	cmd.Flags().String("provider", "", "typed provider (openai|anthropic|stripe|github): fills host + auth header, use with --path")
 	cmd.Flags().String("path", "", "path for --provider mode, e.g. /v1/models")
 	cmd.Flags().StringArrayP("header", "H", nil, "header 'Key: Value'; use {{secret}} for the value")
 	cmd.Flags().StringP("body", "d", "", "request body, or @file to read from a file; may contain {{secret}}")
-	_ = cmd.MarkFlagRequired("secret")
 	return cmd
 }
 
@@ -57,12 +57,23 @@ func runCall(cmd *cobra.Command, opts Options) error {
 		return err
 	}
 	secret, _ := cmd.Flags().GetString("secret")
+	sessionID, _ := cmd.Flags().GetString("session")
 	method, _ := cmd.Flags().GetString("method")
 	rawURL, _ := cmd.Flags().GetString("url")
 	provider, _ := cmd.Flags().GetString("provider")
 	path, _ := cmd.Flags().GetString("path")
 	headerArgs, _ := cmd.Flags().GetStringArray("header")
 	bodyArg, _ := cmd.Flags().GetString("body")
+
+	// The secret is bound either directly (--secret) or by an open session
+	// (--session); exactly one must be given. A session already fixes the secret,
+	// so passing both is ambiguous.
+	if sessionID != "" && secret != "" {
+		return fmt.Errorf("--session and --secret are mutually exclusive (the session already binds the secret)")
+	}
+	if sessionID == "" && secret == "" {
+		return fmt.Errorf("provide --secret NAME, or --session ID from `secrevo session open`")
+	}
 
 	headers, err := parseHeaders(headerArgs)
 	if err != nil {
@@ -100,13 +111,84 @@ func runCall(cmd *cobra.Command, opts Options) error {
 
 	req := client.ProxyRequest{Method: method, URL: rawURL, Headers: headers, Body: body}
 	return withClient(opts, func(api APIClient) error {
-		resp, err := api.ProxyConsume(cmd.Context(), ws, secret, req)
+		var resp client.ProxyResponse
+		var err error
+		if sessionID != "" {
+			resp, err = api.ProxySessionConsume(cmd.Context(), ws, sessionID, req)
+		} else {
+			resp, err = api.ProxyConsume(cmd.Context(), ws, secret, req)
+		}
 		if err != nil {
 			return err
 		}
 		// The response never contains the secret value; print it as structured
 		// JSON (status + projected/redacted body + flags).
 		return writeJSON(opts.Out, resp)
+	})
+}
+
+// newSessionCommand implements `secrevo session` — open/close a short-lived,
+// identity-bound proxy-session for a multi-step mediated flow (login→use,
+// pagination). Each step is a `secrevo call --session <id> ...`; every request
+// is re-authorized and re-checked server-side (SPEC v3 §4). The value never
+// reaches this process at any step.
+func newSessionCommand(opts Options) *cobra.Command {
+	s := &cobra.Command{
+		Use:   "session",
+		Short: "Open/close a proxy-session for multi-step mediated consumption",
+	}
+
+	open := &cobra.Command{
+		Use:   "open --secret NAME",
+		Short: "Open a proxy-session bound to your identity; prints {session_id, expires_at}",
+		Long: "Open a short-lived session, then run each step as `secrevo call --session <id> ...`.\n" +
+			"The session is bound to your identity, expires (default 5 min), and dies on grant revocation.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSessionOpen(cmd, opts)
+		},
+	}
+	open.Flags().StringP("secret", "s", "", "secret name the session consumes (required)")
+	_ = open.MarkFlagRequired("secret")
+
+	closeCmd := &cobra.Command{
+		Use:   "close --session ID",
+		Short: "End a proxy-session early",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runSessionClose(cmd, opts)
+		},
+	}
+	closeCmd.Flags().String("session", "", "session id to close (required)")
+	_ = closeCmd.MarkFlagRequired("session")
+
+	s.AddCommand(open, closeCmd)
+	return s
+}
+
+func runSessionOpen(cmd *cobra.Command, opts Options) error {
+	ws, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+	name, _ := cmd.Flags().GetString("secret")
+	return withClient(opts, func(api APIClient) error {
+		sess, err := api.OpenProxySession(cmd.Context(), ws, name)
+		if err != nil {
+			return err
+		}
+		return writeJSON(opts.Out, sess)
+	})
+}
+
+func runSessionClose(cmd *cobra.Command, opts Options) error {
+	ws, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+	sessionID, _ := cmd.Flags().GetString("session")
+	return withClient(opts, func(api APIClient) error {
+		return api.CloseProxySession(cmd.Context(), ws, sessionID)
 	})
 }
 
