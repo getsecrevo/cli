@@ -271,6 +271,38 @@ func (c *Client) ProxyConsume(ctx context.Context, workspaceID, name string, req
 	return out, err
 }
 
+// ProxySession is a short-lived, identity-bound handle for a multi-step mediated
+// flow. The value never reaches this process; every request against the session
+// is re-authorized and re-checked server-side (SPEC v3 §4).
+type ProxySession struct {
+	SessionID string `json:"session_id"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// OpenProxySession mints a session against the named secret (secret.read). The
+// returned session id is used with ProxySessionConsume for each step.
+func (c *Client) OpenProxySession(ctx context.Context, workspaceID, name string) (ProxySession, error) {
+	var out ProxySession
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/proxy-session", url.PathEscape(workspaceID), url.PathEscape(name))
+	err := c.doJSON(ctx, http.MethodPost, path, map[string]any{}, &out)
+	return out, err
+}
+
+// ProxySessionConsume issues one mediated request within an open session and
+// returns only the response. The value never reaches this process.
+func (c *Client) ProxySessionConsume(ctx context.Context, workspaceID, sessionID string, req ProxyRequest) (ProxyResponse, error) {
+	var out ProxyResponse
+	path := fmt.Sprintf("/v1/workspaces/%s/proxy-sessions/%s/requests", url.PathEscape(workspaceID), url.PathEscape(sessionID))
+	err := c.doJSON(ctx, http.MethodPost, path, req, &out)
+	return out, err
+}
+
+// CloseProxySession ends a session early. A missing session is treated as closed.
+func (c *Client) CloseProxySession(ctx context.Context, workspaceID, sessionID string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/proxy-sessions/%s", url.PathEscape(workspaceID), url.PathEscape(sessionID))
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
 // ProxyTarget is one allowlisted operation for a secret's mediated proxy.
 type ProxyTarget struct {
 	Host             string            `json:"host"`

@@ -87,6 +87,15 @@ func (f fakeAPIClient) DeleteSecret(context.Context, string, string) error {
 func (f fakeAPIClient) ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
 	return client.ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true}, nil
 }
+func (f fakeAPIClient) OpenProxySession(context.Context, string, string) (client.ProxySession, error) {
+	return client.ProxySession{SessionID: "psess_fake", ExpiresAt: "2026-01-01T00:00:00Z"}, nil
+}
+func (f fakeAPIClient) ProxySessionConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
+	return client.ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true}, nil
+}
+func (f fakeAPIClient) CloseProxySession(context.Context, string, string) error {
+	return nil
+}
 func (f fakeAPIClient) ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error) {
 	return nil, nil
 }
@@ -187,6 +196,15 @@ func (f *secretWritingFake) DeleteSecret(_ context.Context, _ string, secretID s
 }
 func (f *secretWritingFake) ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
 	return client.ProxyResponse{}, errors.New("secretWritingFake does not support ProxyConsume")
+}
+func (f *secretWritingFake) OpenProxySession(context.Context, string, string) (client.ProxySession, error) {
+	return client.ProxySession{}, errors.New("secretWritingFake does not support OpenProxySession")
+}
+func (f *secretWritingFake) ProxySessionConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
+	return client.ProxyResponse{}, errors.New("secretWritingFake does not support ProxySessionConsume")
+}
+func (f *secretWritingFake) CloseProxySession(context.Context, string, string) error {
+	return errors.New("secretWritingFake does not support CloseProxySession")
 }
 func (f *secretWritingFake) ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error) {
 	return nil, nil
@@ -329,6 +347,117 @@ func TestCallProviderBuildsTypedRequest(t *testing.T) {
 	}
 	if fake.gotReq.Headers["Authorization"] != "Bearer {{secret}}" {
 		t.Fatalf("provider auth header = %q", fake.gotReq.Headers["Authorization"])
+	}
+}
+
+// sessionCapturingFake records session open + session-scoped consume calls.
+type sessionCapturingFake struct {
+	fakeAPIClient
+	openWS, openSecret        string
+	consumeWS, consumeSession string
+	consumeReq                client.ProxyRequest
+	closeWS, closeSess        string
+	proxyConsumeCalled        bool
+}
+
+func (f *sessionCapturingFake) OpenProxySession(_ context.Context, ws, name string) (client.ProxySession, error) {
+	f.openWS, f.openSecret = ws, name
+	return client.ProxySession{SessionID: "psess_abc", ExpiresAt: "2026-07-15T00:05:00Z"}, nil
+}
+func (f *sessionCapturingFake) ProxySessionConsume(_ context.Context, ws, sid string, req client.ProxyRequest) (client.ProxyResponse, error) {
+	f.consumeWS, f.consumeSession, f.consumeReq = ws, sid, req
+	return client.ProxyResponse{Status: 200, Body: `{"ok":1}`, Projected: true}, nil
+}
+func (f *sessionCapturingFake) CloseProxySession(_ context.Context, ws, sid string) error {
+	f.closeWS, f.closeSess = ws, sid
+	return nil
+}
+func (f *sessionCapturingFake) ProxyConsume(context.Context, string, string, client.ProxyRequest) (client.ProxyResponse, error) {
+	f.proxyConsumeCalled = true
+	return client.ProxyResponse{}, errors.New("session flow must not use the one-shot proxy")
+}
+
+// TestSessionOpen: `secrevo session open` prints the handle from the API.
+func TestSessionOpen(t *testing.T) {
+	var out bytes.Buffer
+	fake := &sessionCapturingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"session", "open", "--secret", "ODOO"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.openSecret != "ODOO" {
+		t.Fatalf("open secret = %q", fake.openSecret)
+	}
+	if !strings.Contains(out.String(), "psess_abc") {
+		t.Fatalf("session open output missing handle: %q", out.String())
+	}
+}
+
+// TestCallWithSessionRoutesToSessionEndpoint: `call --session` uses the session
+// consume path (not the one-shot proxy) and does not require --secret.
+func TestCallWithSessionRoutesToSessionEndpoint(t *testing.T) {
+	var out bytes.Buffer
+	fake := &sessionCapturingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"call", "--session", "psess_abc", "--url", "https://api.example.com/v1/models"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.proxyConsumeCalled {
+		t.Fatalf("call --session must not hit the one-shot proxy")
+	}
+	if fake.consumeSession != "psess_abc" || fake.consumeReq.URL != "https://api.example.com/v1/models" {
+		t.Fatalf("session consume = %q %q", fake.consumeSession, fake.consumeReq.URL)
+	}
+}
+
+// TestCallSessionAndSecretMutuallyExclusive: passing both is a usage error.
+func TestCallSessionAndSecretMutuallyExclusive(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return &sessionCapturingFake{}, nil },
+	})
+	cmd.SetArgs([]string{"call", "--session", "psess_abc", "--secret", "ODOO", "--url", "https://api.example.com/x"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually-exclusive error, got %v", err)
+	}
+}
+
+// TestCallRequiresSecretOrSession: neither given is a usage error.
+func TestCallRequiresSecretOrSession(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return &sessionCapturingFake{}, nil },
+	})
+	cmd.SetArgs([]string{"call", "--url", "https://api.example.com/x"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--secret") {
+		t.Fatalf("expected secret-or-session error, got %v", err)
+	}
+}
+
+// TestSessionClose: `secrevo session close` forwards the id to the API.
+func TestSessionClose(t *testing.T) {
+	var out bytes.Buffer
+	fake := &sessionCapturingFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"session", "close", "--session", "psess_abc"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.closeSess != "psess_abc" {
+		t.Fatalf("close session = %q", fake.closeSess)
 	}
 }
 
