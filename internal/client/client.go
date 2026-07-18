@@ -390,6 +390,14 @@ type CredScope struct {
 	MaxTTLSeconds int               `json:"max_ttl_seconds,omitempty"`
 }
 
+// SetAgentRead flips a secret's per-secret agent raw-read opt-in (human session;
+// secret.write). When allowed, an agent with secret.read may read this secret's
+// raw value (the deliberate exception to the agent read-cut).
+func (c *Client) SetAgentRead(ctx context.Context, workspaceID, secretID string, allowed bool) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/agent-read", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	return c.doJSON(ctx, http.MethodPut, path, map[string]bool{"allowed": allowed}, nil)
+}
+
 // GetCredScope returns a secret's cred scope (human session; secret.write).
 func (c *Client) GetCredScope(ctx context.Context, workspaceID, secretID string) (CredScope, error) {
 	var out CredScope

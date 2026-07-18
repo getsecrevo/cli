@@ -120,6 +120,9 @@ func (f fakeAPIClient) PutCredScope(_ context.Context, _ string, _ string, s cli
 func (f fakeAPIClient) DeleteCredScope(context.Context, string, string) error {
 	return nil
 }
+func (f fakeAPIClient) SetAgentRead(context.Context, string, string, bool) error {
+	return nil
+}
 
 // secretWritingFake captures create/rotate calls so the secret-set/update
 // tests can assert exactly which path was taken. The list of pre-existing
@@ -240,6 +243,9 @@ func (f *secretWritingFake) PutCredScope(_ context.Context, _ string, _ string, 
 	return s, nil
 }
 func (f *secretWritingFake) DeleteCredScope(context.Context, string, string) error {
+	return nil
+}
+func (f *secretWritingFake) SetAgentRead(context.Context, string, string, bool) error {
 	return nil
 }
 func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID string, req client.SecretUpdateRequest) (client.Secret, error) {
