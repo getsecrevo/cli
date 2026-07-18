@@ -56,6 +56,7 @@ type APIClient interface {
 	GetCredScope(context.Context, string, string) (client.CredScope, error)
 	PutCredScope(context.Context, string, string, client.CredScope) (client.CredScope, error)
 	DeleteCredScope(context.Context, string, string) error
+	SetAgentRead(context.Context, string, string, bool) error
 }
 
 type Options struct {
@@ -276,6 +277,7 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretRevealCommand(opts))
 	secret.AddCommand(newSecretProxyTargetCommand(opts))
 	secret.AddCommand(newSecretCredScopeCommand(opts))
+	secret.AddCommand(newSecretAgentReadCommand(opts))
 	return secret
 }
 
