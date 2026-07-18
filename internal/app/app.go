@@ -52,6 +52,10 @@ type APIClient interface {
 	ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error)
 	PutProxyTarget(context.Context, string, string, client.ProxyTarget) (client.ProxyTarget, error)
 	DeleteProxyTarget(context.Context, string, string, string) error
+	MintCreds(context.Context, string, string, int) (client.Cred, error)
+	GetCredScope(context.Context, string, string) (client.CredScope, error)
+	PutCredScope(context.Context, string, string, client.CredScope) (client.CredScope, error)
+	DeleteCredScope(context.Context, string, string) error
 }
 
 type Options struct {
@@ -156,6 +160,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newRunCommand(opts))
 	root.AddCommand(newCallCommand(opts))
 	root.AddCommand(newSessionCommand(opts))
+	root.AddCommand(newCredsCommand(opts))
 	root.AddCommand(newSSHRunCommand(opts))
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))
@@ -270,6 +275,7 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretDeleteCommand(opts))
 	secret.AddCommand(newSecretRevealCommand(opts))
 	secret.AddCommand(newSecretProxyTargetCommand(opts))
+	secret.AddCommand(newSecretCredScopeCommand(opts))
 	return secret
 }
 

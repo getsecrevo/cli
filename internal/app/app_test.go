@@ -105,6 +105,21 @@ func (f fakeAPIClient) PutProxyTarget(_ context.Context, _ string, _ string, t c
 func (f fakeAPIClient) DeleteProxyTarget(context.Context, string, string, string) error {
 	return nil
 }
+func (f fakeAPIClient) MintCreds(_ context.Context, _ string, _ string, ttl int) (client.Cred, error) {
+	return client.Cred{
+		Provider: client.CredProviderAWSSTS, AccessKeyID: "ASIAEXAMPLE", SecretAccessKey: "secretpart",
+		SessionToken: "sessiontok", Expiration: "2030-01-01T00:00:00Z", TTLSeconds: 900,
+	}, nil
+}
+func (f fakeAPIClient) GetCredScope(context.Context, string, string) (client.CredScope, error) {
+	return client.CredScope{Provider: client.CredProviderAWSSTS, Config: map[string]string{"role_arn": "arn:aws:iam::007761758105:role/x"}, MaxTTLSeconds: 900}, nil
+}
+func (f fakeAPIClient) PutCredScope(_ context.Context, _ string, _ string, s client.CredScope) (client.CredScope, error) {
+	return s, nil
+}
+func (f fakeAPIClient) DeleteCredScope(context.Context, string, string) error {
+	return nil
+}
 
 // secretWritingFake captures create/rotate calls so the secret-set/update
 // tests can assert exactly which path was taken. The list of pre-existing
@@ -213,6 +228,18 @@ func (f *secretWritingFake) PutProxyTarget(_ context.Context, _ string, _ string
 	return t, nil
 }
 func (f *secretWritingFake) DeleteProxyTarget(context.Context, string, string, string) error {
+	return nil
+}
+func (f *secretWritingFake) MintCreds(context.Context, string, string, int) (client.Cred, error) {
+	return client.Cred{}, errors.New("secretWritingFake does not support MintCreds")
+}
+func (f *secretWritingFake) GetCredScope(context.Context, string, string) (client.CredScope, error) {
+	return client.CredScope{}, errors.New("secretWritingFake does not support GetCredScope")
+}
+func (f *secretWritingFake) PutCredScope(_ context.Context, _ string, _ string, s client.CredScope) (client.CredScope, error) {
+	return s, nil
+}
+func (f *secretWritingFake) DeleteCredScope(context.Context, string, string) error {
 	return nil
 }
 func (f *secretWritingFake) UpdateSecret(_ context.Context, _ string, secretID string, req client.SecretUpdateRequest) (client.Secret, error) {
