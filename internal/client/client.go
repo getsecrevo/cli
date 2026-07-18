@@ -361,6 +361,15 @@ type Cred struct {
 	TTLSeconds      int    `json:"ttl_seconds"`
 }
 
+// String redacts the live material so an accidental %v/%s/log never leaks the
+// cred (mirrors the server-side MintedCred/CredsReply guard, R1-M3). Callers
+// print the cred deliberately via printCred; nothing logs the struct today, but
+// this backstops a future careless log/error-wrap.
+func (Cred) String() string { return "Cred{REDACTED}" }
+
+// GoString redacts for %#v too.
+func (Cred) GoString() string { return "Cred{REDACTED}" }
+
 // MintCreds asks the server to mint an ephemeral credential for the named secret.
 // ttlSeconds is a request (0 = server default); the mediator clamps it to the
 // per-secret and IAM-role caps. The api authorizes secret.creds and forwards the
