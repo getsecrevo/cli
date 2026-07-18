@@ -340,6 +340,69 @@ func (c *Client) DeleteProxyTarget(ctx context.Context, workspaceID, secretID, h
 	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
+// Cred provider identifiers (mirror the api's store constants). aws_sts mints
+// short-lived AWS creds via STS AssumeRole; db mints a dynamic DB user via
+// OpenBao's database engine.
+const (
+	CredProviderAWSSTS = "aws_sts"
+	CredProviderDB     = "db"
+)
+
+// Cred is a short-lived, scoped ephemeral credential minted for a secret (F3,
+// INV-11). Unlike a mediated call, the cred DOES come back to this process — the
+// deliberate, TTL-bounded exception for loads that must see bytes (AWS SigV4, DB
+// clients). It is never persisted by the CLI; print it and let it expire.
+type Cred struct {
+	Provider        string `json:"provider"`
+	AccessKeyID     string `json:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	SessionToken    string `json:"session_token,omitempty"`
+	Expiration      string `json:"expiration"`
+	TTLSeconds      int    `json:"ttl_seconds"`
+}
+
+// MintCreds asks the server to mint an ephemeral credential for the named secret.
+// ttlSeconds is a request (0 = server default); the mediator clamps it to the
+// per-secret and IAM-role caps. The api authorizes secret.creds and forwards the
+// mint to the isolated mediator; the returned cred is scoped + short-lived.
+func (c *Client) MintCreds(ctx context.Context, workspaceID, name string, ttlSeconds int) (Cred, error) {
+	var out Cred
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/creds", url.PathEscape(workspaceID), url.PathEscape(name))
+	err := c.doJSON(ctx, http.MethodPost, path, map[string]any{"ttl_seconds": ttlSeconds}, &out)
+	return out, err
+}
+
+// CredScope declares, per secret, what ephemeral credential it mints and its
+// scope (human-only to edit; INV-7). aws_sts: Config{role_arn, session_policy?};
+// db: Config{openbao_db_role}.
+type CredScope struct {
+	Provider      string            `json:"provider"`
+	Config        map[string]string `json:"config"`
+	MaxTTLSeconds int               `json:"max_ttl_seconds,omitempty"`
+}
+
+// GetCredScope returns a secret's cred scope (human session; secret.write).
+func (c *Client) GetCredScope(ctx context.Context, workspaceID, secretID string) (CredScope, error) {
+	var out CredScope
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/cred-scope", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
+// PutCredScope upserts a secret's cred scope (human session; secret.write).
+func (c *Client) PutCredScope(ctx context.Context, workspaceID, secretID string, s CredScope) (CredScope, error) {
+	var out CredScope
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/cred-scope", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	err := c.doJSON(ctx, http.MethodPut, path, s, &out)
+	return out, err
+}
+
+// DeleteCredScope removes a secret's cred scope (human session; secret.write).
+func (c *Client) DeleteCredScope(ctx context.Context, workspaceID, secretID string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/cred-scope", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
 func (c *Client) ListSecrets(ctx context.Context, workspaceID string) (SecretListResponse, error) {
 	var out SecretListResponse
 	path := fmt.Sprintf("/v1/workspaces/%s/secrets", url.PathEscape(workspaceID))
