@@ -130,6 +130,53 @@ func TestCredScopeAddBuildsAwsScope(t *testing.T) {
 	}
 }
 
+// TestCredScopeAddBuildsFederationScope: aws_federation needs no role/allowlist;
+// --access-key-id / --region / --policy map into Config, none required.
+func TestCredScopeAddBuildsFederationScope(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingCredScopeFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "cred-scope", "add", "--secret", "OPENAI_API_KEY",
+		"--provider", "aws_federation", "--access-key-id", "AKIAOWNER", "--policy", `{"Version":"2012-10-17"}`})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.putScope.Provider != "aws_federation" {
+		t.Fatalf("expected aws_federation provider, got %q", fake.putScope.Provider)
+	}
+	if fake.putScope.Config["access_key_id"] != "AKIAOWNER" || fake.putScope.Config["policy"] == "" {
+		t.Fatalf("federation config not built: %+v", fake.putScope.Config)
+	}
+	if _, hasRole := fake.putScope.Config["role_arn"]; hasRole {
+		t.Fatalf("aws_federation must not carry a role_arn: %+v", fake.putScope.Config)
+	}
+}
+
+// TestCredScopeAddDefaultProviderIsFederation: with no --provider, the default is
+// aws_federation (the self-serve recommended path), which needs no extra flags.
+func TestCredScopeAddDefaultProviderIsFederation(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingCredScopeFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "cred-scope", "add", "--secret", "OPENAI_API_KEY"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.putScope.Provider != "aws_federation" {
+		t.Fatalf("expected default provider aws_federation, got %q", fake.putScope.Provider)
+	}
+}
+
 // TestCredScopeAddRequiresRoleARN: aws_sts without --role-arn is rejected.
 func TestCredScopeAddRequiresRoleARN(t *testing.T) {
 	var out bytes.Buffer

@@ -346,6 +346,10 @@ func (c *Client) DeleteProxyTarget(ctx context.Context, workspaceID, secretID, h
 const (
 	CredProviderAWSSTS = "aws_sts"
 	CredProviderDB     = "db"
+	// CredProviderAWSFederation mints short-lived AWS creds via STS
+	// GetFederationToken using the secret's OWN stored AWS key (F3 R3): self-serve
+	// scope reduction (an inline Policy can only narrow), no role, no allowlist.
+	CredProviderAWSFederation = "aws_federation"
 )
 
 // Cred is a short-lived, scoped ephemeral credential minted for a secret (F3,
