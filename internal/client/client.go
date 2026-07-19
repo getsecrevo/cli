@@ -138,6 +138,11 @@ type Secret struct {
 	HasProxyTarget      *bool    `json:"has_proxy_target,omitempty"`
 	HasCredScope        *bool    `json:"has_cred_scope,omitempty"`
 	UsableByAgentVia    []string `json:"usable_by_agent_via,omitempty"`
+	// SuggestedNextStep is present on a single-secret GET only when nothing is
+	// configured for agent use: a hint naming the next commands to make the secret
+	// agent-usable without plaintext. Kept as a pointer + omitempty so `secret get`
+	// surfaces it when present and `secret list` output stays unchanged.
+	SuggestedNextStep *string `json:"suggested_next_step,omitempty"`
 }
 
 type SecretListResponse struct {
