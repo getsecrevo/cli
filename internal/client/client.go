@@ -18,6 +18,72 @@ import (
 
 var ErrNotConfigured = errors.New("secrevo API client is not configured")
 
+// APIError is a typed non-2xx response that carries the api's actionable error
+// envelope {error, message, remediation, retryable}. It exists so a mechanism
+// wall (mediated_not_configured, ephemeral_not_supported, creds_not_enabled, the
+// agent raw-read cut, …) surfaces its REMEDIATION prominently instead of dumping
+// raw JSON, and so callers can honour retryable:false (a policy/config cut is
+// terminal — don't retry). Error() still embeds the numeric status and the code
+// so existing substring checks (e.g. "404" + "not_found_previous") keep working.
+type APIError struct {
+	Status      int    // HTTP status code
+	Code        string // stable machine code (the envelope's "error" field)
+	Message     string // one-line human statement
+	Remediation string // next step + alternative (may be empty for non-wall errors)
+	Retryable   bool   // false = terminal; do not retry
+	raw         string // original body, for errors that are not the envelope shape
+}
+
+func (e *APIError) Error() string {
+	// Lead with status + code so scripts and existing substring matches keep
+	// working; append the human message; then, if present, put the remediation on
+	// its own line so it reads as the actionable next step.
+	head := fmt.Sprintf("api returned %d", e.Status)
+	if e.Code != "" {
+		head += " " + e.Code
+	}
+	msg := e.Message
+	if msg == "" {
+		msg = e.raw
+	}
+	out := head
+	if msg != "" {
+		out += ": " + msg
+	}
+	if e.Remediation != "" {
+		out += "\n  → " + e.Remediation
+	}
+	return out
+}
+
+// parseAPIError builds a typed error from a non-2xx response body. When the body
+// is the actionable envelope it returns a rich *APIError; otherwise it falls back
+// to a plain message that still embeds the status and raw body (back-compat).
+func parseAPIError(status int, body []byte) error {
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) == 0 {
+		return &APIError{Status: status}
+	}
+	var env struct {
+		Error       string `json:"error"`
+		Message     string `json:"message"`
+		Remediation string `json:"remediation"`
+		Retryable   bool   `json:"retryable"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Error != "" {
+		return &APIError{
+			Status:      status,
+			Code:        env.Error,
+			Message:     env.Message,
+			Remediation: env.Remediation,
+			Retryable:   env.Retryable,
+			raw:         trimmed,
+		}
+	}
+	// Not the envelope shape — keep the legacy "api returned <status>: <body>".
+	return &APIError{Status: status, raw: trimmed, Message: trimmed}
+}
+
 type Config struct {
 	BaseURL    string
 	Token      string
@@ -64,6 +130,14 @@ type Secret struct {
 	Status                   string   `json:"status"`
 	Tags                     []string `json:"tags"`
 	UpdatedAt                string   `json:"updated_at"`
+	// Agent-usability introspection (Agent DX), populated only on single-secret
+	// GET: lets an agent (or its author) discover HOW this secret may be used
+	// without seeing plaintext, so `secrevo secret get` shows it rather than the
+	// agent guessing. Pointers/omitempty keep list output unchanged.
+	AgentRawReadAllowed *bool    `json:"agent_raw_read_allowed,omitempty"`
+	HasProxyTarget      *bool    `json:"has_proxy_target,omitempty"`
+	HasCredScope        *bool    `json:"has_cred_scope,omitempty"`
+	UsableByAgentVia    []string `json:"usable_by_agent_via,omitempty"`
 }
 
 type SecretListResponse struct {
@@ -524,10 +598,9 @@ func (c *Client) doJSONWithHeader(ctx context.Context, method, path string, reqB
 
 	if resp.StatusCode >= 300 {
 		message, _ := io.ReadAll(resp.Body)
-		if len(message) == 0 {
-			return resp.Header, fmt.Errorf("api returned %s", resp.Status)
-		}
-		return resp.Header, fmt.Errorf("api returned %s: %s", resp.Status, strings.TrimSpace(string(message)))
+		// Parse the actionable envelope so a mechanism wall surfaces its remediation
+		// (and callers can read retryable) instead of a raw JSON dump.
+		return resp.Header, parseAPIError(resp.StatusCode, message)
 	}
 
 	if respBody == nil {
