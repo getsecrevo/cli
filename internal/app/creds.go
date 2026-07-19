@@ -78,16 +78,16 @@ func runCreds(cmd *cobra.Command, opts Options) error {
 func printCred(opts Options, cred client.Cred, format string) error {
 	switch format {
 	case "env":
-		if cred.Provider != client.CredProviderAWSSTS {
-			return fmt.Errorf("--format env is only supported for aws_sts credentials (got %q); use --format json", cred.Provider)
+		if !isAWSCredProvider(cred.Provider) {
+			return fmt.Errorf("--format env is only supported for AWS credentials (got %q); use --format json", cred.Provider)
 		}
 		fmt.Fprintf(opts.Out, "export AWS_ACCESS_KEY_ID=%s\n", cred.AccessKeyID)
 		fmt.Fprintf(opts.Out, "export AWS_SECRET_ACCESS_KEY=%s\n", cred.SecretAccessKey)
 		fmt.Fprintf(opts.Out, "export AWS_SESSION_TOKEN=%s\n", cred.SessionToken)
 		return nil
 	case "aws-process":
-		if cred.Provider != client.CredProviderAWSSTS {
-			return fmt.Errorf("--format aws-process is only supported for aws_sts credentials (got %q)", cred.Provider)
+		if !isAWSCredProvider(cred.Provider) {
+			return fmt.Errorf("--format aws-process is only supported for AWS credentials (got %q)", cred.Provider)
 		}
 		// The exact shape the AWS CLI/SDK expects from a credential_process.
 		out := map[string]any{
@@ -105,6 +105,12 @@ func printCred(opts Options, cred client.Cred, format string) error {
 	}
 }
 
+// isAWSCredProvider reports whether a cred provider yields AWS-shaped credentials
+// (access key id + secret + session token), so env / aws-process formats apply.
+func isAWSCredProvider(provider string) bool {
+	return provider == client.CredProviderAWSSTS || provider == client.CredProviderAWSFederation
+}
+
 // newSecretCredScopeCommand manages a secret's ephemeral-credential scope
 // (human-only server-side: an agent can never widen its own credential scope).
 // The scope declares what kind of cred `secrevo creds` mints and its bounds. The
@@ -117,15 +123,27 @@ func newSecretCredScopeCommand(opts Options) *cobra.Command {
 	}
 
 	add := &cobra.Command{
-		Use:   "add --secret NAME --provider aws_sts --role-arn ARN [flags]",
+		Use:   "add --secret NAME --provider aws_federation [flags]",
 		Short: "Declare what ephemeral credential a secret mints and its bounds",
-		Args:  cobra.NoArgs,
+		Long: "Declare the ephemeral-credential scope for a secret.\n\n" +
+			"Providers:\n" +
+			"  aws_federation  (recommended) mint short-lived AWS creds from the secret's OWN\n" +
+			"                  stored key via STS GetFederationToken. Self-serve: no role, no\n" +
+			"                  allowlist. --policy narrows permissions (can only reduce); the\n" +
+			"                  stored value provides the key (JSON with both fields, or the value\n" +
+			"                  is the secret access key and --access-key-id gives the AKIA id).\n" +
+			"  aws_sts         assume an IaC-allowlisted IAM role (mediator's own identity).\n" +
+			"  db              OpenBao database engine dynamic role.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runCredScopeAdd(cmd, opts)
 		},
 	}
 	add.Flags().String("secret", "", "secret name (required)")
-	add.Flags().String("provider", "aws_sts", "cred provider: aws_sts | db")
+	add.Flags().String("provider", "aws_federation", "cred provider: aws_federation | aws_sts | db")
+	add.Flags().String("access-key-id", "", "aws_federation: the AKIA… access key id (only if the stored value is just the secret key)")
+	add.Flags().String("region", "", "aws_federation: STS region (default us-east-1)")
+	add.Flags().String("policy", "", "aws_federation: optional inline IAM policy JSON that REDUCES the key's permissions")
 	add.Flags().String("role-arn", "", "aws_sts: IAM role ARN to assume (must be on the mediator's IaC allowlist)")
 	add.Flags().String("session-policy", "", "aws_sts: optional inline session policy JSON (can only REDUCE scope)")
 	add.Flags().String("db-role", "", "db: OpenBao database engine role name")
@@ -165,6 +183,9 @@ func runCredScopeAdd(cmd *cobra.Command, opts Options) error {
 	}
 	name, _ := cmd.Flags().GetString("secret")
 	provider, _ := cmd.Flags().GetString("provider")
+	accessKeyID, _ := cmd.Flags().GetString("access-key-id")
+	region, _ := cmd.Flags().GetString("region")
+	policy, _ := cmd.Flags().GetString("policy")
 	roleARN, _ := cmd.Flags().GetString("role-arn")
 	sessionPolicy, _ := cmd.Flags().GetString("session-policy")
 	dbRole, _ := cmd.Flags().GetString("db-role")
@@ -172,6 +193,19 @@ func runCredScopeAdd(cmd *cobra.Command, opts Options) error {
 
 	config := map[string]string{}
 	switch provider {
+	case client.CredProviderAWSFederation:
+		// No required flag: the key comes from the stored value (JSON with both
+		// fields) or from the value (secret key) + --access-key-id. Policy/region
+		// are optional (empty policy → "ephemeral copy of the key, TTL-bounded").
+		if accessKeyID != "" {
+			config["access_key_id"] = accessKeyID
+		}
+		if region != "" {
+			config["region"] = region
+		}
+		if policy != "" {
+			config["policy"] = policy
+		}
 	case client.CredProviderAWSSTS:
 		if roleARN == "" {
 			return fmt.Errorf("--role-arn is required for provider aws_sts")
@@ -186,7 +220,7 @@ func runCredScopeAdd(cmd *cobra.Command, opts Options) error {
 		}
 		config["openbao_db_role"] = dbRole
 	default:
-		return fmt.Errorf("unknown --provider %q (aws_sts | db)", provider)
+		return fmt.Errorf("unknown --provider %q (aws_federation | aws_sts | db)", provider)
 	}
 
 	maxTTLSeconds := 0
