@@ -120,6 +120,12 @@ func newSecretCredScopeCommand(opts Options) *cobra.Command {
 	cs := &cobra.Command{
 		Use:   "cred-scope",
 		Short: "Manage the ephemeral-credential scope for a secret (human only)",
+		Long: "Declare that an agent may mint short-lived, scoped credentials FROM this secret\n" +
+			"without seeing the long-lived key (e.g. an AWS key used for SigV4). This is a\n" +
+			"HUMAN authorization step — do it here, or from the dashboard: the secret's page at\n" +
+			"app.secrevo.com/secrets. An agent can never grant or widen its own scope, and the\n" +
+			"mint is re-clamped server-side. Once set, the agent mints via `secrevo creds`.\n" +
+			"For HTTP API keys use `secret proxy-target` (mediated call) instead.",
 	}
 
 	add := &cobra.Command{

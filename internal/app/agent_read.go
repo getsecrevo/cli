@@ -16,7 +16,13 @@ func newSecretAgentReadCommand(opts Options) *cobra.Command {
 		Long: "By default an agent cannot read a secret's raw value. `allow` opts a specific\n" +
 			"secret in — for a value you deem low-risk, or already protected by other means\n" +
 			"(MFA, scoped permissions) — so your agent can read it; Secrevo then only reduces\n" +
-			"exposure. `deny` reverts to the safe default.",
+			"exposure. `deny` reverts to the safe default. Configurable here or from the\n" +
+			"dashboard toggle on the secret's page (app.secrevo.com/secrets).\n\n" +
+			"IMPORTANT — this REVEALS the plaintext: unlike proxy-target (mediated call) and\n" +
+			"cred-scope (ephemeral creds), which let an agent USE a secret WITHOUT ever seeing\n" +
+			"it, agent-read lets the agent READ the value (via `secrevo secret get`) — the agent\n" +
+			"WILL see it. Prefer proxy-target/cred-scope when they fit; use agent-read only when\n" +
+			"the load genuinely needs the raw value (a native DB driver, private-key signing).",
 	}
 
 	allow := &cobra.Command{
