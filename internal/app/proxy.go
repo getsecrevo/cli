@@ -225,6 +225,13 @@ func newSecretProxyTargetCommand(opts Options) *cobra.Command {
 	pt := &cobra.Command{
 		Use:   "proxy-target",
 		Short: "Manage the mediated-proxy operation allowlist for a secret (human only)",
+		Long: "Allowlist which HTTP operations an agent may perform WITH this secret without\n" +
+			"ever seeing its value (the mediated-proxy path). This is a HUMAN authorization\n" +
+			"step — do it here, or from the dashboard: the secret's \"Mediated HTTP\" section at\n" +
+			"app.secrevo.com/secrets. An agent can never widen its own allowlist. Once a target\n" +
+			"is allowed, the agent uses the secret via `secrevo call` and the plaintext never\n" +
+			"enters its process. This is the path for HTTP API keys (OpenAI, Stripe, Odoo, …);\n" +
+			"for AWS keys used by the SDK/CLI use `secret cred-scope` instead.",
 	}
 
 	add := &cobra.Command{
