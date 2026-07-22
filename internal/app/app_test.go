@@ -111,6 +111,10 @@ func (f fakeAPIClient) MintCreds(_ context.Context, _ string, _ string, ttl int)
 		SessionToken: "sessiontok", Expiration: "2030-01-01T00:00:00Z", TTLSeconds: 900,
 	}, nil
 }
+
+func (f fakeAPIClient) MintEKSToken(_ context.Context, _ string, _ string, cluster string, _ string, _ int) (client.EKSToken, error) {
+	return client.EKSToken{Token: "k8s-aws-v1.fake-" + cluster, ExpiresAt: "2030-01-01T00:01:00Z"}, nil
+}
 func (f fakeAPIClient) GetCredScope(context.Context, string, string) (client.CredScope, error) {
 	return client.CredScope{Provider: client.CredProviderAWSSTS, Config: map[string]string{"role_arn": "arn:aws:iam::007761758105:role/x"}, MaxTTLSeconds: 900}, nil
 }
@@ -235,6 +239,9 @@ func (f *secretWritingFake) DeleteProxyTarget(context.Context, string, string, s
 }
 func (f *secretWritingFake) MintCreds(context.Context, string, string, int) (client.Cred, error) {
 	return client.Cred{}, errors.New("secretWritingFake does not support MintCreds")
+}
+func (f *secretWritingFake) MintEKSToken(context.Context, string, string, string, string, int) (client.EKSToken, error) {
+	return client.EKSToken{}, errors.New("secretWritingFake does not support MintEKSToken")
 }
 func (f *secretWritingFake) GetCredScope(context.Context, string, string) (client.CredScope, error) {
 	return client.CredScope{}, errors.New("secretWritingFake does not support GetCredScope")

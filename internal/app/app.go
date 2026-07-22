@@ -53,6 +53,7 @@ type APIClient interface {
 	PutProxyTarget(context.Context, string, string, client.ProxyTarget) (client.ProxyTarget, error)
 	DeleteProxyTarget(context.Context, string, string, string) error
 	MintCreds(context.Context, string, string, int) (client.Cred, error)
+	MintEKSToken(context.Context, string, string, string, string, int) (client.EKSToken, error)
 	GetCredScope(context.Context, string, string) (client.CredScope, error)
 	PutCredScope(context.Context, string, string, client.CredScope) (client.CredScope, error)
 	DeleteCredScope(context.Context, string, string) error
@@ -162,6 +163,7 @@ func NewRootCommand(opts Options) *cobra.Command {
 	root.AddCommand(newCallCommand(opts))
 	root.AddCommand(newSessionCommand(opts))
 	root.AddCommand(newCredsCommand(opts))
+	root.AddCommand(newEKSTokenCommand(opts))
 	root.AddCommand(newSSHRunCommand(opts))
 	root.AddCommand(newImportCommand(opts))
 	root.AddCommand(newEnvCommand(opts))

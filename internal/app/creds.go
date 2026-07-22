@@ -3,11 +3,79 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/getsecrevo/cli/internal/client"
 	"github.com/spf13/cobra"
 )
+
+// newEKSTokenCommand implements `secrevo eks-token` — mint a short-lived EKS bearer
+// token (k8s-aws-v1.) from a secret's stored AWS key WITHOUT ever seeing the key.
+// The token authenticates to the EKS Kubernetes API as the stored key's IAM
+// principal for its TTL; the CLI prints it and NEVER persists it. The secret must
+// have an aws_eks cred-scope set by a human (`secrevo secret cred-scope add
+// --provider aws_eks ...`) and the caller needs the secret.eks capability.
+func newEKSTokenCommand(opts Options) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "eks-token --secret NAME --cluster NAME [--region us-east-1] [--ttl 60s]",
+		Short: "Mint a short-lived EKS bearer token from a secret's key (without seeing the key)",
+		Long: "Mint an EKS bearer token (k8s-aws-v1.) for a stored AWS key without exposing the\n" +
+			"key. Use it as the Kubernetes API bearer (e.g. `kubectl --token`). The token is\n" +
+			"never persisted by the CLI. The secret needs an aws_eks cred-scope, and the\n" +
+			"cluster/region must be on that scope's allowlist; the mint is refused otherwise.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runEKSToken(cmd, opts)
+		},
+	}
+	cmd.Flags().StringP("secret", "s", "", "secret name holding the AWS key (required)")
+	cmd.Flags().String("cluster", "", "target EKS cluster name (required; must be on the scope allowlist)")
+	cmd.Flags().String("region", "", "AWS region (default us-east-1; must be on the scope allowlist if set)")
+	cmd.Flags().String("ttl", "", "requested token lifetime, e.g. 60s (server default 60s, max 900s)")
+	cmd.Flags().String("format", "token", "output format: token (raw bearer) | json")
+	_ = cmd.MarkFlagRequired("secret")
+	_ = cmd.MarkFlagRequired("cluster")
+	return cmd
+}
+
+func runEKSToken(cmd *cobra.Command, opts Options) error {
+	ws, err := workspaceID(cmd)
+	if err != nil {
+		return err
+	}
+	name, _ := cmd.Flags().GetString("secret")
+	cluster, _ := cmd.Flags().GetString("cluster")
+	region, _ := cmd.Flags().GetString("region")
+	ttlRaw, _ := cmd.Flags().GetString("ttl")
+	format, _ := cmd.Flags().GetString("format")
+
+	ttlSeconds := 0
+	if ttlRaw != "" {
+		d, err := time.ParseDuration(ttlRaw)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("invalid --ttl %q: use a positive duration like 60s or 15m", ttlRaw)
+		}
+		ttlSeconds = int(d.Seconds())
+	}
+	switch format {
+	case "token", "json":
+	default:
+		return fmt.Errorf("invalid --format %q: use token | json", format)
+	}
+
+	return withClient(opts, func(api APIClient) error {
+		tok, err := api.MintEKSToken(cmd.Context(), ws, name, cluster, region, ttlSeconds)
+		if err != nil {
+			return err
+		}
+		if format == "json" {
+			return writeJSON(opts.Out, tok)
+		}
+		_, err = fmt.Fprintln(opts.Out, tok.Token)
+		return err
+	})
+}
 
 // newCredsCommand implements `secrevo creds` — mint a short-lived, scoped
 // ephemeral credential for a secret (F3, INV-11). Unlike `secrevo call`
@@ -138,6 +206,10 @@ func newSecretCredScopeCommand(opts Options) *cobra.Command {
 			"                  allowlist. --policy narrows permissions (can only reduce); the\n" +
 			"                  stored value provides the key (JSON with both fields, or the value\n" +
 			"                  is the secret access key and --access-key-id gives the AKIA id).\n" +
+			"  aws_eks         mint a short-lived EKS bearer token (k8s-aws-v1.) from the\n" +
+			"                  secret's OWN stored key WITHOUT exposing it. --allowed-clusters\n" +
+			"                  (required) and --allowed-regions bound where it can be used; the\n" +
+			"                  agent mints via `secrevo eks-token`, gated by secret.eks.\n" +
 			"  aws_sts         assume an IaC-allowlisted IAM role (mediator's own identity).\n" +
 			"  db              OpenBao database engine dynamic role.",
 		Args: cobra.NoArgs,
@@ -146,14 +218,16 @@ func newSecretCredScopeCommand(opts Options) *cobra.Command {
 		},
 	}
 	add.Flags().String("secret", "", "secret name (required)")
-	add.Flags().String("provider", "aws_federation", "cred provider: aws_federation | aws_sts | db")
+	add.Flags().String("provider", "aws_federation", "cred provider: aws_federation | aws_eks | aws_sts | db")
 	add.Flags().String("access-key-id", "", "aws_federation: the AKIA… access key id (only if the stored value is just the secret key)")
 	add.Flags().String("region", "", "aws_federation: STS region (default us-east-1)")
 	add.Flags().String("policy", "", "aws_federation: optional inline IAM policy JSON that REDUCES the key's permissions")
 	add.Flags().String("role-arn", "", "aws_sts: IAM role ARN to assume (must be on the mediator's IaC allowlist)")
 	add.Flags().String("session-policy", "", "aws_sts: optional inline session policy JSON (can only REDUCE scope)")
 	add.Flags().String("db-role", "", "db: OpenBao database engine role name")
-	add.Flags().String("max-ttl", "", "cap the credential lifetime for this secret, e.g. 15m")
+	add.Flags().String("allowed-clusters", "", "aws_eks: comma-separated EKS cluster name(s) this secret may mint tokens for (required)")
+	add.Flags().String("allowed-regions", "", "aws_eks: comma-separated region(s) allowed (optional; empty = any, default us-east-1)")
+	add.Flags().String("max-ttl", "", "cap the credential lifetime for this secret, e.g. 15m (aws_eks: max 900s)")
 	_ = add.MarkFlagRequired("secret")
 
 	list := &cobra.Command{
@@ -195,6 +269,8 @@ func runCredScopeAdd(cmd *cobra.Command, opts Options) error {
 	roleARN, _ := cmd.Flags().GetString("role-arn")
 	sessionPolicy, _ := cmd.Flags().GetString("session-policy")
 	dbRole, _ := cmd.Flags().GetString("db-role")
+	allowedClusters, _ := cmd.Flags().GetString("allowed-clusters")
+	allowedRegions, _ := cmd.Flags().GetString("allowed-regions")
 	maxTTLRaw, _ := cmd.Flags().GetString("max-ttl")
 
 	config := map[string]string{}
@@ -220,13 +296,24 @@ func runCredScopeAdd(cmd *cobra.Command, opts Options) error {
 		if sessionPolicy != "" {
 			config["session_policy"] = sessionPolicy
 		}
+	case client.CredProviderAWSEKS:
+		if strings.TrimSpace(allowedClusters) == "" {
+			return fmt.Errorf("--allowed-clusters is required for provider aws_eks")
+		}
+		config["allowed_clusters"] = allowedClusters
+		if strings.TrimSpace(allowedRegions) != "" {
+			config["allowed_regions"] = allowedRegions
+		}
+		if accessKeyID != "" {
+			config["access_key_id"] = accessKeyID
+		}
 	case client.CredProviderDB:
 		if dbRole == "" {
 			return fmt.Errorf("--db-role is required for provider db")
 		}
 		config["openbao_db_role"] = dbRole
 	default:
-		return fmt.Errorf("unknown --provider %q (aws_federation | aws_sts | db)", provider)
+		return fmt.Errorf("unknown --provider %q (aws_federation | aws_eks | aws_sts | db)", provider)
 	}
 
 	maxTTLSeconds := 0

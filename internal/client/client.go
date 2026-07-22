@@ -429,6 +429,11 @@ const (
 	// GetFederationToken using the secret's OWN stored AWS key (F3 R3): self-serve
 	// scope reduction (an inline Policy can only narrow), no role, no allowlist.
 	CredProviderAWSFederation = "aws_federation"
+	// CredProviderAWSEKS mints a short-lived EKS bearer token (k8s-aws-v1.) from the
+	// secret's OWN stored AWS key WITHOUT exposing the key. Config carries the
+	// cluster/region allowlist: allowed_clusters (required), allowed_regions
+	// (optional). Gated by the secret.eks capability (not secret.creds).
+	CredProviderAWSEKS = "aws_eks"
 )
 
 // Cred is a short-lived, scoped ephemeral credential minted for a secret (F3,
@@ -464,9 +469,38 @@ func (c *Client) MintCreds(ctx context.Context, workspaceID, name string, ttlSec
 	return out, err
 }
 
+// EKSToken is a short-lived EKS bearer token (k8s-aws-v1.) minted for a secret's
+// stored AWS key WITHOUT exposing the key. It is never persisted by the CLI; use
+// it and let it expire (it authenticates to the EKS Kubernetes API as the stored
+// key's IAM principal for its TTL).
+type EKSToken struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// String/GoString redact the bearer so an accidental %v/log never leaks it.
+func (EKSToken) String() string   { return "EKSToken{REDACTED}" }
+func (EKSToken) GoString() string { return "EKSToken{REDACTED}" }
+
+// MintEKSToken asks the server to mint an EKS bearer token for the named secret,
+// targeting cluster/region for ttlSeconds (0 = server default 60). The api
+// authorizes secret.eks and forwards the mint to the isolated mediator, which
+// enforces the cluster/region allowlist, clamps the TTL, and presigns from the
+// stored key — the key never leaves the mediator.
+func (c *Client) MintEKSToken(ctx context.Context, workspaceID, name, cluster, region string, ttlSeconds int) (EKSToken, error) {
+	var out EKSToken
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/by-name/%s/eks-token", url.PathEscape(workspaceID), url.PathEscape(name))
+	body := map[string]any{"cluster_name": cluster, "ttl_seconds": ttlSeconds}
+	if region != "" {
+		body["region"] = region
+	}
+	err := c.doJSON(ctx, http.MethodPost, path, body, &out)
+	return out, err
+}
+
 // CredScope declares, per secret, what ephemeral credential it mints and its
 // scope (human-only to edit; INV-7). aws_sts: Config{role_arn, session_policy?};
-// db: Config{openbao_db_role}.
+// db: Config{openbao_db_role}; aws_eks: Config{allowed_clusters, allowed_regions?}.
 type CredScope struct {
 	Provider      string            `json:"provider"`
 	Config        map[string]string `json:"config"`
