@@ -130,6 +130,101 @@ func TestCredScopeAddBuildsAwsScope(t *testing.T) {
 	}
 }
 
+// TestCredScopeAddBuildsEKSScope: aws_eks builds a cluster/region allowlist Config
+// from --allowed-clusters / --allowed-regions.
+func TestCredScopeAddBuildsEKSScope(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingCredScopeFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "cred-scope", "add", "--secret", "OPENAI_API_KEY",
+		"--provider", "aws_eks", "--allowed-clusters", "eks-ganemo,eks-two", "--allowed-regions", "us-east-1", "--max-ttl", "15m"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.putScope.Provider != client.CredProviderAWSEKS {
+		t.Fatalf("expected provider aws_eks, got %q", fake.putScope.Provider)
+	}
+	if fake.putScope.Config["allowed_clusters"] != "eks-ganemo,eks-two" || fake.putScope.Config["allowed_regions"] != "us-east-1" {
+		t.Fatalf("unexpected eks scope config: %+v", fake.putScope.Config)
+	}
+	if fake.putScope.MaxTTLSeconds != 900 {
+		t.Fatalf("expected max_ttl 900s, got %d", fake.putScope.MaxTTLSeconds)
+	}
+}
+
+// TestCredScopeAddEKSRequiresAllowedClusters: aws_eks without --allowed-clusters is
+// refused before any call (a scope with no clusters can never mint anything).
+func TestCredScopeAddEKSRequiresAllowedClusters(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingCredScopeFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "cred-scope", "add", "--secret", "OPENAI_API_KEY", "--provider", "aws_eks"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected an error when --allowed-clusters is missing for aws_eks")
+	}
+}
+
+// capturingEKSFake records the MintEKSToken call so the eks-token command's
+// flag→request mapping can be asserted. Embeds fakeAPIClient for the rest.
+type capturingEKSFake struct {
+	fakeAPIClient
+	ws, name, cluster, region string
+	ttl                       int
+}
+
+func (f *capturingEKSFake) MintEKSToken(_ context.Context, ws, name, cluster, region string, ttl int) (client.EKSToken, error) {
+	f.ws, f.name, f.cluster, f.region, f.ttl = ws, name, cluster, region, ttl
+	return client.EKSToken{Token: "k8s-aws-v1.MINTED", ExpiresAt: "2030-01-01T00:01:00Z"}, nil
+}
+
+// TestEKSTokenMintsAndPrints: `secrevo eks-token` maps flags to the mint call and
+// prints the raw bearer by default.
+func TestEKSTokenMintsAndPrints(t *testing.T) {
+	var out bytes.Buffer
+	fake := &capturingEKSFake{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"eks-token", "--secret", "GANEMO_EKS_KEY", "--cluster", "eks-ganemo", "--region", "us-east-1", "--ttl", "60s"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	if fake.name != "GANEMO_EKS_KEY" || fake.cluster != "eks-ganemo" || fake.region != "us-east-1" || fake.ttl != 60 {
+		t.Fatalf("unexpected mint args: %+v", fake)
+	}
+	if strings.TrimSpace(out.String()) != "k8s-aws-v1.MINTED" {
+		t.Fatalf("expected the raw bearer on stdout, got %q", out.String())
+	}
+}
+
+// TestEKSTokenRequiresCluster: --cluster is required.
+func TestEKSTokenRequiresCluster(t *testing.T) {
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &out,
+		Err:           &out,
+		ClientFactory: func() (APIClient, error) { return &capturingEKSFake{}, nil },
+	})
+	cmd.SetArgs([]string{"eks-token", "--secret", "GANEMO_EKS_KEY"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected an error when --cluster is missing")
+	}
+}
+
 // TestCredScopeAddBuildsFederationScope: aws_federation needs no role/allowlist;
 // --access-key-id / --region / --policy map into Config, none required.
 func TestCredScopeAddBuildsFederationScope(t *testing.T) {
