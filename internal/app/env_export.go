@@ -122,7 +122,7 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 		for _, spec := range specs {
 			revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, spec.secretName, "")
 			if err != nil {
-				return fmt.Errorf("reveal %s: %w", spec.secretName, err)
+				return revealSpecError(workspaceID, spec, err)
 			}
 			line, err := shellExportLine(shell, spec.envName, revealed.Value)
 			if err != nil {

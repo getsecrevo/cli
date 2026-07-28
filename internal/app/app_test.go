@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -621,6 +622,101 @@ func TestRunReportsUnknownSecretWithName(t *testing.T) {
 	}
 	if runner.spec.Command != "" {
 		t.Fatalf("runner should not have been invoked; got %+v", runner.spec)
+	}
+}
+
+// notFoundRevealClient returns the api's by-name lookup miss as the typed
+// envelope the real client parses, so the tests exercise the same path a live
+// 404 takes.
+type notFoundRevealClient struct{ fakeAPIClient }
+
+func (notFoundRevealClient) RevealSecretValueByName(context.Context, string, string, string) (client.SecretValue, error) {
+	return client.SecretValue{}, &client.APIError{
+		Status:      http.StatusNotFound,
+		Code:        "not_found",
+		Message:     "No secret with that name exists in this workspace (names resolve exactly, case-sensitively).",
+		Remediation: "Confirm the exact name with `secrevo secret list`.",
+	}
+}
+
+// TestRunInvertedSecretSpecNamesTheFix is the regression for the incident that
+// motivated this: `--secret X=THE_SECRET` looks up a secret literally named "X"
+// and 404s. The operand order is the reverse of `docker -e` / `env` / a shell
+// prefix, so getting it backwards is easy; the error must not merely report the
+// miss, it must print the corrected command.
+func TestRunInvertedSecretSpecNamesTheFix(t *testing.T) {
+	var out bytes.Buffer
+	runner := &recordingRunner{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return notFoundRevealClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--secret", "X=GITHUB_PERSONAL_ACCESS_TOKEN", "--", "echo", "x"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected an error for an inverted --secret spec")
+	}
+	if !strings.Contains(err.Error(), "did you mean: --secret GITHUB_PERSONAL_ACCESS_TOKEN=X") {
+		t.Fatalf("error must name the corrected command, got:\n%s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "SECRET_NAME=ENV_VAR") {
+		t.Fatalf("error must state the operand order, got:\n%s", err.Error())
+	}
+	if runner.spec.Command != "" {
+		t.Fatalf("a failed reveal must never spawn the child; got %+v", runner.spec)
+	}
+}
+
+// TestRunPlainMissingSecretKeepsApiRemediation: with no '=' there are no operands
+// to have swapped, so inventing a "did you mean" would be noise. The plain
+// wrapping is kept, which is what lets the api's own remediation surface.
+func TestRunPlainMissingSecretKeepsApiRemediation(t *testing.T) {
+	var out bytes.Buffer
+	runner := &recordingRunner{}
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1",
+		Out:         &out,
+		Err:         &out,
+		Runner:      runner,
+		ClientFactory: func() (APIClient, error) {
+			return notFoundRevealClient{}, nil
+		},
+	})
+	cmd.SetArgs([]string{"run", "--secret", "TYPOED_NAME", "--", "echo", "x"})
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), `reveal secret "TYPOED_NAME"`) {
+		t.Fatalf("Execute() error = %v, want the plain wrapped miss", err)
+	}
+	if strings.Contains(err.Error(), "did you mean") {
+		t.Fatalf("must not suggest a swap when no '=' was written, got:\n%s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "secrevo secret list") {
+		t.Fatalf("the api remediation must still reach the caller, got:\n%s", err.Error())
+	}
+}
+
+// TestIsSecretNotFoundIgnoresGraceMiss: not_found_previous is also a 404 but means
+// an expired grace window, not a bad name. Matching it would print an operand-order
+// hint at a caller whose operands were fine.
+func TestIsSecretNotFoundIgnoresGraceMiss(t *testing.T) {
+	if !isSecretNotFound(&client.APIError{Status: http.StatusNotFound, Code: "not_found"}) {
+		t.Fatal("a 404 not_found must be recognized")
+	}
+	if isSecretNotFound(&client.APIError{Status: http.StatusNotFound, Code: "not_found_previous"}) {
+		t.Fatal("not_found_previous is a different condition and must not match")
+	}
+	if isSecretNotFound(&client.APIError{Status: http.StatusForbidden, Code: "forbidden"}) {
+		t.Fatal("a 403 must not match")
+	}
+	if isSecretNotFound(nil) {
+		t.Fatal("nil must not match")
 	}
 }
 
