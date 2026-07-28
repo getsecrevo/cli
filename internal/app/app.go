@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -407,6 +408,59 @@ func isNotFoundPrevious(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "404") && strings.Contains(msg, "not_found_previous")
+}
+
+// isSecretNotFound recognizes the api's by-name lookup miss. It matches on the
+// typed code rather than a substring so it cannot be confused with
+// "not_found_previous", which is a different condition (an expired grace window)
+// and shares the 404 status.
+func isSecretNotFound(err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusNotFound && apiErr.Code == "not_found"
+}
+
+// invertedSpecError explains a lookup miss for a spec the operator wrote as
+// NAME=ENV. `--secret` takes the SECRET name on the left and the env var on the
+// right, which is the opposite of the `VAR=value` order every other tool uses
+// (`docker -e`, `env`, a shell prefix), so writing it backwards is the single
+// most likely way to reach a 404 while holding a perfectly valid secret name.
+//
+// The api cannot detect this — it only ever receives the name that failed. The
+// CLI holds BOTH operands, so it can name the corrected command exactly. That is
+// also why this does not merely echo the api's remediation: a generic "check the
+// operand order" leaves the caller to work out the fix, and an agent that has to
+// infer the fix is an agent that escalates to a human instead.
+type invertedSpecError struct {
+	spec        secretSpec
+	workspaceID string
+	err         error
+}
+
+func (e *invertedSpecError) Error() string {
+	return fmt.Sprintf(
+		"reveal secret %q: no secret with that name in workspace %q.\n"+
+			"  → `--secret` takes SECRET_NAME=ENV_VAR — the SECRET name goes on the LEFT, the env var on the right.\n"+
+			"    you wrote:    --secret %s=%s\n"+
+			"    did you mean: --secret %s=%s",
+		e.spec.secretName, e.workspaceID,
+		e.spec.secretName, e.spec.envName,
+		e.spec.envName, e.spec.secretName,
+	)
+}
+
+func (e *invertedSpecError) Unwrap() error { return e.err }
+
+// revealSpecError wraps a failed by-name reveal. A 404 on an explicit NAME=ENV
+// spec gets the swap hint; everything else keeps the previous wrapping so the
+// api's own remediation (rendered by APIError) still reaches the caller.
+func revealSpecError(workspaceID string, spec secretSpec, err error) error {
+	if spec.explicit && isSecretNotFound(err) {
+		return &invertedSpecError{spec: spec, workspaceID: workspaceID, err: err}
+	}
+	return fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
 }
 
 // isForbidden recognizes the api's 403 missing-capability response. The client
@@ -1157,6 +1211,10 @@ func allSecretSpecs(secrets []client.Secret, sanitize bool) ([]secretSpec, error
 type secretSpec struct {
 	secretName string
 	envName    string
+	// explicit records that the operator actually wrote NAME=ENV rather than
+	// letting the env var default. Only then can a lookup miss be the operands
+	// written in the other order, which is what makes the swap hint safe to show.
+	explicit bool
 }
 
 // parseSecretSpecs parses repeated --secret flags into specs. When the
@@ -1205,7 +1263,7 @@ func parseSecretSpecs(raw []string, sanitizeDefault bool) ([]secretSpec, error) 
 			return nil, fmt.Errorf("env var %q would be set twice (from %q and %q)", envName, previous, secretName)
 		}
 		seen[envName] = secretName
-		out = append(out, secretSpec{secretName: secretName, envName: envName})
+		out = append(out, secretSpec{secretName: secretName, envName: envName, explicit: explicit})
 	}
 	return out, nil
 }
@@ -1261,7 +1319,7 @@ func buildInjectedEnvByName(ctx context.Context, api APIClient, workspaceID stri
 			if isForbidden(err) {
 				return nil, forbiddenRunError(spec.secretName, err)
 			}
-			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
+			return nil, revealSpecError(workspaceID, spec, err)
 		}
 		env = append(env, spec.envName+"="+revealed.Value)
 	}
