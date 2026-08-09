@@ -1093,6 +1093,14 @@ useful when the operator knows their shell handles the non-POSIX form).
 --all injects every secret visible to the current token (one reveal per
 secret, sanitized env var name) and cannot be combined with --secret.
 
+--tag NAME injects every visible secret carrying that tag, under the same
+sanitized names --all uses. Repeat --tag to narrow further: a secret must
+carry ALL the tags given (AND, never OR), so an extra --tag always shrinks
+the selection. It is --all made smaller, which is the point — prefer it to
+--all whenever the process only needs one project's credentials. If no
+visible secret matches, the command fails and lists the tags actually in
+use instead of injecting nothing and letting the child fail later.
+
 The child inherits stdin/stdout/stderr and the calling process's environment
 (plus the injected secrets). SIGINT/SIGTERM received by the CLI are
 forwarded to the child so wrappers like ` + "`docker run`" + ` and ` + "`kubectl`" + ` get
@@ -1110,6 +1118,8 @@ Examples:
   secrevo run --secret prod-stripe=STRIPE_API_KEY -- npm test
   secrevo run --secret aws.cloudwatch.webhooks.url --raw-name -- legacy-script
   secrevo run --all -- python agent.py
+  secrevo run --tag sunat -- python bot.py
+  secrevo run --tag odoo --tag prod -- ./deploy.sh      # secrets with BOTH tags
 `,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1120,9 +1130,20 @@ Examples:
 			rawSpecs, _ := cmd.Flags().GetStringArray("secret")
 			rawName, _ := cmd.Flags().GetBool("raw-name")
 			injectAll, _ := cmd.Flags().GetBool("all")
+			rawTags, _ := cmd.Flags().GetStringArray("tag")
+			tagFilter := normalizeTagFilter(rawTags)
 			if injectAll && len(rawSpecs) > 0 {
 				return fmt.Errorf("--all cannot be combined with --secret; --all already injects every visible secret")
 			}
+			if len(tagFilter) > 0 && len(rawSpecs) > 0 {
+				return fmt.Errorf("--tag cannot be combined with --secret; --tag selects secrets by tag, --secret names them one by one")
+			}
+			if len(tagFilter) > 0 && injectAll {
+				return fmt.Errorf("--tag cannot be combined with --all; --tag IS --all narrowed to the tagged secrets")
+			}
+			// --tag reuses the list-driven path; it is --all with a filter, which
+			// is why it is strictly SMALLER than --all and never larger.
+			listDriven := injectAll || len(tagFilter) > 0
 
 			api, err := getClient(opts)
 			if err != nil {
@@ -1133,12 +1154,16 @@ Examples:
 				specs []secretSpec
 				env   []string
 			)
-			if injectAll {
+			if listDriven {
 				list, err := api.ListSecrets(cmd.Context(), workspaceID)
 				if err != nil {
 					return fmt.Errorf("list workspace secrets: %w", err)
 				}
-				specs, err = allSecretSpecs(list.Secrets, !rawName)
+				selected := filterSecretsByTags(list.Secrets, tagFilter)
+				if len(tagFilter) > 0 && len(selected) == 0 {
+					return errNoSecretsForTags(tagFilter, list.Secrets)
+				}
+				specs, err = allSecretSpecs(selected, !rawName)
 				if err != nil {
 					return err
 				}
@@ -1177,6 +1202,7 @@ Examples:
 		},
 	}
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to inject (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
+	cmd.Flags().StringArray("tag", nil, "Inject every visible secret carrying this tag (repeatable; a secret must carry ALL of them). Mutually exclusive with --secret and --all.")
 	cmd.Flags().Bool("raw-name", false, "Inject under the secret's literal name (skip POSIX sanitization)")
 	cmd.Flags().Bool("all", false, "Inject every secret visible to the current token (mutually exclusive with --secret)")
 	return cmd

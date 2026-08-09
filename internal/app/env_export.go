@@ -15,7 +15,7 @@ import (
 
 func newEnvCommand(opts Options) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "env [--secret NAME[=ENV_VAR]...] [--all]",
+		Use:   "env [--secret NAME[=ENV_VAR]...] [--tag NAME...] [--all]",
 		Short: "Print shell-eval-friendly export lines for the requested secrets",
 		Long: `Emit lines that the parent shell can ` + "`eval`" + ` to set Secrevo
 secrets as environment variables for the current session — without
@@ -45,6 +45,15 @@ Combining --all reveals every secret visible to the agent and exports
 each under its sanitized canonical name (use with care — a typo in your
 shell history could expose them downstream).
 
+--tag NAME does the same for just the secrets carrying that tag. Repeat
+it to narrow further: a secret must carry ALL the tags given (AND, never
+OR), so an extra --tag always shrinks the selection. Prefer it to --all
+whenever the shell only needs one project's credentials — it exports
+strictly less. If nothing matches, the command fails and lists the tags
+actually in use rather than exporting nothing.
+
+    eval "$(secrevo env --tag sunat)"
+
 The default shell is auto-detected from $SHELL on POSIX and from
 $PSModulePath on Windows; override with --shell.
 `,
@@ -55,6 +64,7 @@ $PSModulePath on Windows; override with --shell.
 	}
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to emit (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
 	cmd.Flags().Bool("all", false, "Emit every secret visible to the token (mutually exclusive with --secret)")
+	cmd.Flags().StringArray("tag", nil, "Emit every visible secret carrying this tag (repeatable; a secret must carry ALL of them). Mutually exclusive with --secret and --all.")
 	cmd.Flags().String("shell", "", "Shell format: posix, powershell, fish. Default: auto-detect.")
 	cmd.Flags().Bool("raw-name", false, "Emit under the secret's literal name (skip POSIX sanitization)")
 	return cmd
@@ -69,12 +79,22 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	emitAll, _ := cmd.Flags().GetBool("all")
 	shellFlag, _ := cmd.Flags().GetString("shell")
 	rawName, _ := cmd.Flags().GetBool("raw-name")
+	rawTags, _ := cmd.Flags().GetStringArray("tag")
+	tagFilter := normalizeTagFilter(rawTags)
 
 	if emitAll && len(rawSpecs) > 0 {
 		return fmt.Errorf("--all and --secret are mutually exclusive")
 	}
-	if !emitAll && len(rawSpecs) == 0 {
-		return fmt.Errorf("provide --secret NAME (repeatable) or --all")
+	if len(tagFilter) > 0 && len(rawSpecs) > 0 {
+		return fmt.Errorf("--tag cannot be combined with --secret; --tag selects secrets by tag, --secret names them one by one")
+	}
+	if len(tagFilter) > 0 && emitAll {
+		return fmt.Errorf("--tag cannot be combined with --all; --tag IS --all narrowed to the tagged secrets")
+	}
+	// --tag rides the same list-driven path as --all, filtered. Strictly smaller.
+	listDriven := emitAll || len(tagFilter) > 0
+	if !listDriven && len(rawSpecs) == 0 {
+		return fmt.Errorf("provide --secret NAME (repeatable), --tag NAME, or --all")
 	}
 
 	shell, err := pickShell(shellFlag)
@@ -83,13 +103,17 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	}
 
 	return withClient(opts, func(api APIClient) error {
-		if emitAll {
+		if listDriven {
 			list, err := api.ListSecrets(cmd.Context(), workspaceID)
 			if err != nil {
 				return fmt.Errorf("list secrets: %w", err)
 			}
-			specs := make([]secretSpec, 0, len(list.Secrets))
-			for _, s := range list.Secrets {
+			selected := filterSecretsByTags(list.Secrets, tagFilter)
+			if len(tagFilter) > 0 && len(selected) == 0 {
+				return errNoSecretsForTags(tagFilter, list.Secrets)
+			}
+			specs := make([]secretSpec, 0, len(selected))
+			for _, s := range selected {
 				envName := s.Name
 				if !rawName {
 					envName = sanitizeEnvName(s.Name)
