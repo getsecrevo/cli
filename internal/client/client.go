@@ -187,7 +187,11 @@ type SecretCreateRequest struct {
 }
 
 type SecretValueWriteRequest struct {
-	Value string `json:"value"`
+	Value string `json:"value,omitempty"`
+	// Fields writes a multi-field secret. Exactly one of Value and Fields is
+	// sent; both are omitempty so a scalar write is byte-identical on the wire
+	// to what it has always been.
+	Fields map[string]string `json:"fields,omitempty"`
 }
 
 // SecretUpdateRequest is the PATCH payload for secret metadata. Every
@@ -653,4 +657,15 @@ func (c *Client) doJSONWithHeader(ctx context.Context, method, path string, reqB
 
 func (c *Client) resolve(path string) string {
 	return strings.TrimRight(c.baseURL.String(), "/") + "/" + strings.TrimLeft(path, "/")
+}
+
+// RotateSecretFields writes a multi-field value. It replaces the WHOLE bundle,
+// because the store has no merge and the api cannot read the current values to
+// merge on the caller's behalf — so every field must be present.
+func (c *Client) RotateSecretFields(ctx context.Context, workspaceID, secretID string, fields map[string]string, grace string) error {
+	path := fmt.Sprintf("/v1/workspaces/%s/secrets/%s/value", url.PathEscape(workspaceID), url.PathEscape(secretID))
+	if g := strings.TrimSpace(grace); g != "" {
+		path += "?grace=" + url.QueryEscape(g)
+	}
+	return c.doJSON(ctx, http.MethodPut, path, SecretValueWriteRequest{Fields: fields}, nil)
 }
