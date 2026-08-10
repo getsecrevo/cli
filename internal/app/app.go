@@ -1154,6 +1154,14 @@ useful when the operator knows their shell handles the non-POSIX form).
 --all injects every secret visible to the current token (one reveal per
 secret, sanitized env var name) and cannot be combined with --secret.
 
+--secret-field SECRET.FIELD injects ONE field of a multi-field secret,
+defaulting to the env var SECRET_FIELD. The split is at the LAST dot,
+because a secret NAME may legally contain dots (the api only forbids
+control characters) and the CLI itself documents one that does. The part
+after the last dot must look like a field name, and a miss names the
+fields the secret actually has, so a wrong split fails loudly instead of
+injecting the wrong credential.
+
 --tag NAME injects every visible secret carrying that tag, under the same
 sanitized names --all uses. Repeat --tag to narrow further: a secret must
 carry ALL the tags given (AND, never OR), so an extra --tag always shrinks
@@ -1180,6 +1188,7 @@ Examples:
   secrevo run --secret aws.cloudwatch.webhooks.url --raw-name -- legacy-script
   secrevo run --all -- python agent.py
   secrevo run --tag sunat -- python bot.py
+  secrevo run --secret-field GANEMO_SUNAT_SOL.clave=SOL_PASSWORD -- python bot.py
   secrevo run --tag odoo --tag prod -- ./deploy.sh      # secrets with BOTH tags
 `,
 		Args: cobra.MinimumNArgs(1),
@@ -1193,6 +1202,14 @@ Examples:
 			injectAll, _ := cmd.Flags().GetBool("all")
 			rawTags, _ := cmd.Flags().GetStringArray("tag")
 			tagFilter := normalizeTagFilter(rawTags)
+			rawFieldSpecs, _ := cmd.Flags().GetStringArray("secret-field")
+			fieldSpecs, err := parseFieldSpecs(rawFieldSpecs)
+			if err != nil {
+				return err
+			}
+			if len(fieldSpecs) > 0 && (injectAll || len(tagFilter) > 0) {
+				return fmt.Errorf("--secret-field selects ONE field of ONE secret; it cannot be combined with --all or --tag")
+			}
 			if injectAll && len(rawSpecs) > 0 {
 				return fmt.Errorf("--all cannot be combined with --secret; --all already injects every visible secret")
 			}
@@ -1242,6 +1259,15 @@ Examples:
 					return err
 				}
 			}
+			if len(fieldSpecs) > 0 {
+				if env == nil {
+					env = contextEnv(workspaceID)
+				}
+				env, err = appendInjectedFields(cmd.Context(), api, workspaceID, env, fieldSpecs)
+				if err != nil {
+					return err
+				}
+			}
 
 			runner := opts.Runner
 			if runner == nil {
@@ -1264,6 +1290,7 @@ Examples:
 	}
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to inject (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
 	cmd.Flags().StringArray("tag", nil, "Inject every visible secret carrying this tag (repeatable; a secret must carry ALL of them). Mutually exclusive with --secret and --all.")
+	cmd.Flags().StringArray("secret-field", nil, "Inject ONE field of a multi-field secret (repeatable). Format: SECRET.FIELD or SECRET.FIELD=ENV_VAR.")
 	cmd.Flags().Bool("raw-name", false, "Inject under the secret's literal name (skip POSIX sanitization)")
 	cmd.Flags().Bool("all", false, "Inject every secret visible to the current token (mutually exclusive with --secret)")
 	return cmd
@@ -1408,7 +1435,43 @@ func buildInjectedEnvByName(ctx context.Context, api APIClient, workspaceID stri
 			}
 			return nil, revealSpecError(workspaceID, spec, err)
 		}
+		if len(revealed.Fields) > 0 {
+			// --secret asks for THE value; a bundle has none. Injecting the
+			// whole thing under one variable would hand the process a JSON blob
+			// it never asked to parse, so name the fields and stop.
+			return nil, fmt.Errorf(
+				"secret %q holds named fields (%s), not a single value. Select one with "+
+					"--secret-field %s.<field>, or add one flag per field",
+				spec.secretName, strings.Join(fieldNamesOf(revealed.Fields), ", "), spec.secretName)
+		}
 		env = append(env, spec.envName+"="+revealed.Value)
+	}
+	return env, nil
+}
+
+// appendInjectedFields resolves each --secret-field spec. One reveal per secret
+// returns the whole bundle (the token is single-use), so several fields of the
+// same secret cost exactly one reveal, not one each.
+func appendInjectedFields(ctx context.Context, api APIClient, workspaceID string, env []string, specs []fieldSpec) ([]string, error) {
+	bundles := make(map[string]map[string]string, len(specs))
+	for _, spec := range specs {
+		fields, ok := bundles[spec.secretName]
+		if !ok {
+			revealed, err := api.RevealSecretValueByName(ctx, workspaceID, spec.secretName, "")
+			if err != nil {
+				if isForbidden(err) {
+					return nil, forbiddenRunError(spec.secretName, err)
+				}
+				return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
+			}
+			fields = revealed.Fields
+			bundles[spec.secretName] = fields
+		}
+		value, ok := fields[spec.fieldName]
+		if !ok {
+			return nil, fieldMissingError(spec.secretName, spec.fieldName, fieldNamesOf(fields))
+		}
+		env = append(env, spec.envName+"="+value)
 	}
 	return env, nil
 }

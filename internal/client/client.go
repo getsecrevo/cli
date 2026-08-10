@@ -153,6 +153,10 @@ type SecretValue struct {
 	WorkspaceID string `json:"workspace_id"`
 	SecretID    string `json:"secret_id"`
 	Value       string `json:"value"`
+	// Fields carries a multi-field secret's whole bundle; Value is empty then.
+	// A scalar secret leaves this nil, so nothing about the existing shape
+	// changes for the secrets that exist today.
+	Fields map[string]string `json:"fields,omitempty"`
 	// GraceExpiresAt is the ISO-8601 timestamp at which the previous value
 	// referenced by `?version=previous` will be discarded. Populated from
 	// the `X-Secrevo-Grace-Expires-At` response header. Empty for the
