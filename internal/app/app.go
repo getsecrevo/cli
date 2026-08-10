@@ -838,9 +838,26 @@ The value source must be exactly one of:
   --from-file PATH    (reads the file as the value, preserving newlines)
   --from-stdin        (reads stdin until EOF)
 
+For a credential made of several parts (user + password, an AWS key pair,
+a connection profile) write NAMED FIELDS instead of one value:
+
+  --fields-file PATH  (a flat JSON object of string values)
+  --fields-stdin      (the same JSON, read from stdin)
+
+Field values are never accepted as command-line arguments. A bundle is
+several credentials at once, so a single careless invocation would put a
+whole login into the shell history and into ps output. Field names are
+lowercase snake_case.
+
+A multi-field write replaces the WHOLE bundle: Secrevo cannot read your
+current values, so it cannot merge a partial update on your behalf. Send
+every field.
+
 Examples:
 
   secrevo secret set OPENAI_API_KEY --value "sk-live-..."
+  secrevo secret set GANEMO_SUNAT_SOL --fields-stdin < fields.json
+  secrevo secret set GANEMO_SUNAT_SOL --fields-file ./sunat.json
   secrevo secret set CLOUDFLARE_TOKEN --from-file ~/.devvault/cf.txt
   cat secret.key | secrevo secret set RSA_PRIVATE --from-stdin
 `,
@@ -852,6 +869,8 @@ Examples:
 	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
 	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
 	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
+	cmd.Flags().String("fields-file", "", "Read a multi-field value from a JSON file: a flat object of string values, e.g. {\"usuario\":\"...\",\"clave\":\"...\"}")
+	cmd.Flags().Bool("fields-stdin", false, "Read a multi-field value as JSON from stdin until EOF")
 	cmd.Flags().String("description", "", "Description, applied only when creating; on an existing secret this errors — use `secret edit` instead")
 	cmd.Flags().String("regeneration-instructions", "", "Rotation notes, applied only when creating; on an existing secret this errors — use `secret edit` instead")
 	cmd.Flags().Bool("update-only", false, "Refuse to create the secret if it does not exist")
@@ -880,6 +899,8 @@ Examples:
 	cmd.Flags().String("value", "", "Literal secret value (cannot combine with --from-file/--from-stdin)")
 	cmd.Flags().String("from-file", "", "Read the secret value from a file path")
 	cmd.Flags().Bool("from-stdin", false, "Read the secret value from stdin until EOF")
+	cmd.Flags().String("fields-file", "", "Read a multi-field value from a JSON file: a flat object of string values, e.g. {\"usuario\":\"...\",\"clave\":\"...\"}")
+	cmd.Flags().Bool("fields-stdin", false, "Read a multi-field value as JSON from stdin until EOF")
 	cmd.Flags().String("grace", "", "Keep the previous value retrievable via `secret reveal --version previous` for this duration (e.g. 30m, 2h, 24h). Format: <int><h|m|s>, range 1m..168h.")
 	return cmd
 }
@@ -890,9 +911,25 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 		return err
 	}
 
-	value, err := readSecretValue(cmd, opts)
+	fieldsPath, _ := cmd.Flags().GetString("fields-file")
+	fieldsStdin, _ := cmd.Flags().GetBool("fields-stdin")
+	fields, err := readSecretFields(fieldsPath, fieldsStdin, opts.Stdin)
 	if err != nil {
 		return err
+	}
+
+	// A multi-field write replaces the WHOLE bundle (the store has no merge, and
+	// Secrevo cannot read your current values to merge on your behalf), so the
+	// scalar flags must not be mixed in: honouring both would make it ambiguous
+	// which one wins and could silently drop fields.
+	var value string
+	if len(fields) == 0 {
+		value, err = readSecretValue(cmd, opts)
+		if err != nil {
+			return err
+		}
+	} else if cmd.Flags().Changed("value") || cmd.Flags().Changed("from-file") || cmd.Flags().Changed("from-stdin") {
+		return fmt.Errorf("--fields-file/--fields-stdin cannot be combined with --value/--from-file/--from-stdin: a secret holds either one value or named fields")
 	}
 
 	updateOnly := forceUpdateOnly
@@ -937,6 +974,18 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 					name, name,
 				)
 			}
+			if len(fields) > 0 {
+				writer, ok := api.(SecretFieldsWriter)
+				if !ok {
+					return fmt.Errorf("this build cannot write multi-field secrets")
+				}
+				if err := writer.RotateSecretFields(cmd.Context(), workspaceID, existing.SecretID, fields, grace); err != nil {
+					return fmt.Errorf("rotate secret fields: %w", err)
+				}
+				_, _ = fmt.Fprintf(opts.Out, "Rotated secret %q (%s) in workspace %s - fields: %s\n",
+					name, existing.SecretID, workspaceID, strings.Join(fieldNamesOf(fields), ", "))
+				return nil
+			}
 			if err := api.RotateSecretValue(cmd.Context(), workspaceID, existing.SecretID, value, grace); err != nil {
 				return fmt.Errorf("rotate secret value: %w", err)
 			}
@@ -972,6 +1021,18 @@ func runSecretSet(cmd *cobra.Command, opts Options, name string, forceUpdateOnly
 		})
 		if err != nil {
 			return fmt.Errorf("create secret: %w", err)
+		}
+		if len(fields) > 0 {
+			writer, ok := api.(SecretFieldsWriter)
+			if !ok {
+				return fmt.Errorf("this build cannot write multi-field secrets")
+			}
+			if err := writer.RotateSecretFields(cmd.Context(), workspaceID, created.SecretID, fields, ""); err != nil {
+				return fmt.Errorf("secret %q was created but its fields could not be written (%w); rerun the same command to finish it", name, err)
+			}
+			_, _ = fmt.Fprintf(opts.Out, "Created secret %q (%s) in workspace %s - fields: %s\n",
+				created.Name, created.SecretID, workspaceID, strings.Join(fieldNamesOf(fields), ", "))
+			return nil
 		}
 		_, _ = fmt.Fprintf(opts.Out, "Created secret %q (%s) in workspace %s\n", created.Name, created.SecretID, workspaceID)
 		return nil
