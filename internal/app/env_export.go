@@ -65,6 +65,7 @@ $PSModulePath on Windows; override with --shell.
 	cmd.Flags().StringArrayP("secret", "s", nil, "Secret to emit (repeatable). Format: NAME or NAME=ENV_VAR_NAME.")
 	cmd.Flags().Bool("all", false, "Emit every secret visible to the token (mutually exclusive with --secret)")
 	cmd.Flags().StringArray("tag", nil, "Emit every visible secret carrying this tag (repeatable; a secret must carry ALL of them). Mutually exclusive with --secret and --all.")
+	cmd.Flags().StringArray("secret-field", nil, "Emit ONE field of a multi-field secret (repeatable). Format: SECRET.FIELD or SECRET.FIELD=ENV_VAR.")
 	cmd.Flags().String("shell", "", "Shell format: posix, powershell, fish. Default: auto-detect.")
 	cmd.Flags().Bool("raw-name", false, "Emit under the secret's literal name (skip POSIX sanitization)")
 	return cmd
@@ -81,6 +82,14 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	rawName, _ := cmd.Flags().GetBool("raw-name")
 	rawTags, _ := cmd.Flags().GetStringArray("tag")
 	tagFilter := normalizeTagFilter(rawTags)
+	rawFieldSpecs, _ := cmd.Flags().GetStringArray("secret-field")
+	fieldSpecs, err := parseFieldSpecs(rawFieldSpecs)
+	if err != nil {
+		return err
+	}
+	if len(fieldSpecs) > 0 && (emitAll || len(tagFilter) > 0) {
+		return fmt.Errorf("--secret-field selects ONE field of ONE secret; it cannot be combined with --all or --tag")
+	}
 
 	if emitAll && len(rawSpecs) > 0 {
 		return fmt.Errorf("--all and --secret are mutually exclusive")
@@ -93,8 +102,8 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 	}
 	// --tag rides the same list-driven path as --all, filtered. Strictly smaller.
 	listDriven := emitAll || len(tagFilter) > 0
-	if !listDriven && len(rawSpecs) == 0 {
-		return fmt.Errorf("provide --secret NAME (repeatable), --tag NAME, or --all")
+	if !listDriven && len(rawSpecs) == 0 && len(fieldSpecs) == 0 {
+		return fmt.Errorf("provide --secret NAME (repeatable), --secret-field SECRET.FIELD, --tag NAME, or --all")
 	}
 
 	shell, err := pickShell(shellFlag)
@@ -136,6 +145,25 @@ func runEnvCommand(cmd *cobra.Command, opts Options) error {
 				}
 				_, _ = fmt.Fprintln(opts.Out, line)
 			}
+			return nil
+		}
+
+		for _, spec := range fieldSpecs {
+			revealed, err := api.RevealSecretValueByName(cmd.Context(), workspaceID, spec.secretName, "")
+			if err != nil {
+				return fmt.Errorf("reveal %s: %w", spec.secretName, err)
+			}
+			value, ok := revealed.Fields[spec.fieldName]
+			if !ok {
+				return fieldMissingError(spec.secretName, spec.fieldName, fieldNamesOf(revealed.Fields))
+			}
+			line, err := shellExportLine(shell, spec.envName, value)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintln(opts.Out, line)
+		}
+		if len(rawSpecs) == 0 {
 			return nil
 		}
 
