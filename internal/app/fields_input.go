@@ -107,6 +107,25 @@ func fieldNamesOf(fields map[string]string) []string {
 	return names
 }
 
+// canonicalBundleJSON renders a revealed bundle as deterministic JSON.
+//
+// It mirrors the mediator's CanonicalBundleJSON: encoding/json already emits a
+// map's keys in sorted order, so two renderings of an unchanged secret are
+// byte-identical and can be diffed. That matters for the surface this feeds —
+// `secrevo secret reveal` writing to a file — and it means the output round
+// trips straight back in through `secrevo secret set --fields-stdin`.
+//
+// It exists because a multi-field secret has NO scalar value: the api leaves
+// `value` empty and puts everything in `fields`. Every surface that rendered
+// `value` unconditionally therefore produced nothing at all.
+func canonicalBundleJSON(fields map[string]string) (string, error) {
+	b, err := json.Marshal(fields)
+	if err != nil {
+		return "", fmt.Errorf("render field bundle: %w", err)
+	}
+	return string(b), nil
+}
+
 // SecretFieldsWriter is the OPTIONAL multi-field half of APIClient, discovered
 // with a type assertion instead of being added to that interface. APIClient is
 // implemented by test fakes; widening it would break the suite by compilation,
