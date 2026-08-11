@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -165,5 +166,28 @@ func TestBootstrapWorkspaceSendsRequestBody(t *testing.T) {
 	}
 	if resp.ID != "workspace-1" {
 		t.Fatalf("unexpected response %#v", resp)
+	}
+}
+
+// TestSecretDecodesFieldNames: the api sends a multi-field secret's field NAMES
+// on the single-secret GET, and the CLI used to silently drop them — so the one
+// command every error message points at ("`secrevo secret get <NAME>` lists its
+// field names") showed none, and an operator had no way to learn how to address
+// --secret-field or {{secret.<field>}}.
+func TestSecretDecodesFieldNames(t *testing.T) {
+	var s Secret
+	if err := json.Unmarshal([]byte(`{"name":"SUNAT","fields":["clave","ruc","usuario"]}`), &s); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(s.Fields) != 3 || s.Fields[0] != "clave" {
+		t.Fatalf("field names dropped: %+v", s.Fields)
+	}
+	// A scalar secret carries none, and omitempty keeps its output unchanged.
+	out, err := json.Marshal(Secret{Name: "SCALAR"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "fields") {
+		t.Fatalf("a scalar secret must not grow a fields key: %s", out)
 	}
 }

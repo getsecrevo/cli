@@ -1249,7 +1249,13 @@ Examples:
 				if err != nil {
 					return err
 				}
-			} else {
+			} else if len(rawSpecs) > 0 || len(fieldSpecs) == 0 {
+				// --secret-field ALONE is a complete selection: it names a secret and
+				// the one field of it to inject. Requiring --secret alongside it made
+				// the command's own documented example fail ("at least one --secret
+				// flag is required"), and forced the operator to inject the very whole
+				// credential they were trying to narrow away from. `env` never had the
+				// restriction, so the two commands also disagreed.
 				specs, err = parseSecretSpecs(rawSpecs, !rawName)
 				if err != nil {
 					return err
@@ -1344,7 +1350,10 @@ type secretSpec struct {
 // operator picked the form they want.
 func parseSecretSpecs(raw []string, sanitizeDefault bool) ([]secretSpec, error) {
 	if len(raw) == 0 {
-		return nil, fmt.Errorf("at least one --secret flag is required")
+		// The suffix names the other ways to select, so an operator who meant to
+		// inject one field or a whole tag is not told to reach for the flag that
+		// injects MORE than they asked for.
+		return nil, fmt.Errorf("at least one --secret flag is required (or --secret-field for a single field of a multi-field secret, --tag/--all to select many)")
 	}
 	out := make([]secretSpec, 0, len(raw))
 	seen := make(map[string]string)
