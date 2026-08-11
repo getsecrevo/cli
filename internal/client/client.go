@@ -143,6 +143,13 @@ type Secret struct {
 	// agent-usable without plaintext. Kept as a pointer + omitempty so `secret get`
 	// surfaces it when present and `secret list` output stays unchanged.
 	SuggestedNextStep *string `json:"suggested_next_step,omitempty"`
+	// Fields lists the NAMES of a multi-field secret's fields (never the values),
+	// and only on the single-secret GET — the list endpoint deliberately omits
+	// them. Without it the CLI silently DROPPED what the api sends, so the one
+	// command every error message points at ("run `secrevo secret get <NAME>` to
+	// see its field names") showed no field names at all, and an operator had no
+	// way to learn how to address `--secret-field` or `{{secret.<field>}}`.
+	Fields []string `json:"fields,omitempty"`
 }
 
 type SecretListResponse struct {
