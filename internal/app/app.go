@@ -377,8 +377,27 @@ func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
 			}
 			return fmt.Errorf("reveal secret %q: %w", name, err)
 		}
+		// A multi-field secret has NO scalar value: the api leaves `value` empty
+		// and puts the whole bundle in `fields`. Rendering revealed.Value
+		// regardless printed a blank line and wrote a ZERO-BYTE file — silently,
+		// with exit 0, so a backup script would report success and store nothing.
+		// Same shape as the defects this feature already produced in the
+		// mcp-server (empty string injected as a credential) and the api
+		// ({"value":""} with a 200): one layer emits a form the next never reads.
+		plain := revealed.Value
+		if len(revealed.Fields) > 0 {
+			bundle, bErr := canonicalBundleJSON(revealed.Fields)
+			if bErr != nil {
+				return fmt.Errorf("reveal secret %q: %w", name, bErr)
+			}
+			plain = bundle
+			// On stderr, so stdout (and any redirect of it) stays byte-exact
+			// while a human still learns what shape they just received.
+			_, _ = fmt.Fprintf(opts.Err, "(%s holds named fields: %s)\n",
+				name, strings.Join(fieldNamesOf(revealed.Fields), ", "))
+		}
 		if toFile != "" {
-			if err := writeSecretToFile(toFile, revealed.Value, opts); err != nil {
+			if err := writeSecretToFile(toFile, plain, opts); err != nil {
 				return err
 			}
 			if revealed.GraceExpiresAt != "" {
@@ -392,7 +411,7 @@ func runSecretReveal(cmd *cobra.Command, opts Options, name string) error {
 		if revealed.GraceExpiresAt != "" {
 			_, _ = fmt.Fprintf(opts.Err, "(previous value, grace expires at %s)\n", revealed.GraceExpiresAt)
 		}
-		_, err = fmt.Fprintln(opts.Out, revealed.Value)
+		_, err = fmt.Fprintln(opts.Out, plain)
 		return err
 	})
 }
@@ -1411,6 +1430,7 @@ func buildInjectedEnvFromList(ctx context.Context, api APIClient, workspaceID st
 	}
 
 	env := contextEnv(workspaceID)
+	var bundled []string
 	for _, spec := range specs {
 		secretID, err := resolveSecretID(list.Secrets, spec.secretName)
 		if err != nil {
@@ -1426,7 +1446,28 @@ func buildInjectedEnvFromList(ctx context.Context, api APIClient, workspaceID st
 			}
 			return nil, fmt.Errorf("reveal secret %q: %w", spec.secretName, err)
 		}
+		// A bundle has no single value, so revealed.Value is EMPTY here. Without
+		// this guard --all injected the empty string as a credential and ran the
+		// command anyway — the child then failed against someone else's server
+		// with a confusing 401, or worse, succeeded unauthenticated. Its sibling
+		// buildInjectedEnvByName has always refused this; the two paths differed
+		// only because no multi-field secret existed to walk down this one.
+		//
+		// Collected rather than returned on the first hit: --all is a bulk
+		// command, and an operator fixing them one error at a time would pay a
+		// full reveal round-trip (and an audit event) per attempt.
+		if len(revealed.Fields) > 0 {
+			bundled = append(bundled, fmt.Sprintf("%s (%s)",
+				spec.secretName, strings.Join(fieldNamesOf(revealed.Fields), ", ")))
+			continue
+		}
 		env = append(env, spec.envName+"="+revealed.Value)
+	}
+	if len(bundled) > 0 {
+		return nil, fmt.Errorf(
+			"--all cannot inject %d secret(s) that hold named fields, because a bundle has no single value to put in one variable: %s. "+
+				"Name the field you want with `--secret-field <SECRET>.<field>` (one flag per field), or drop --all and list the scalar secrets with --secret",
+			len(bundled), strings.Join(bundled, "; "))
 	}
 	return env, nil
 }
