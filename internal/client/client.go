@@ -130,6 +130,16 @@ type Secret struct {
 	Status                   string   `json:"status"`
 	Tags                     []string `json:"tags"`
 	UpdatedAt                string   `json:"updated_at"`
+	// ValueUpdatedAt is when the secret's VALUE was last written, as opposed to
+	// UpdatedAt, which tracks its metadata. Omitted by the api when unknown (a
+	// value written before the api recorded this), so it stays a pointer and is
+	// rendered only when the api sent it — "unknown" must not be shown as a date.
+	//
+	// It has to be listed here at all because this struct is unmarshalled from
+	// the api response and then re-marshalled for output: any field the CLI does
+	// not name is silently DROPPED. That is exactly how this field appeared to be
+	// missing in production when the api was in fact sending it.
+	ValueUpdatedAt *string `json:"value_updated_at,omitempty"`
 	// Agent-usability introspection (Agent DX), populated only on single-secret
 	// GET: lets an agent (or its author) discover HOW this secret may be used
 	// without seeing plaintext, so `secrevo secret get` shows it rather than the
