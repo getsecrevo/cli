@@ -218,6 +218,9 @@ func resolveBody(arg string) (string, error) {
 	return arg, nil
 }
 
+// maxProxyResponseBytes is the mediator's hard cap on a proxied response (1 MiB).
+const maxProxyResponseBytes = 1 << 20
+
 // newSecretProxyTargetCommand manages a secret's mediated-proxy operation
 // allowlist. Human-only server-side (agent tokens are refused): an agent can
 // never widen its own allowlist.
@@ -237,7 +240,11 @@ func newSecretProxyTargetCommand(opts Options) *cobra.Command {
 	add := &cobra.Command{
 		Use:   "add --secret NAME --host HOST --method M --path /PREFIX [flags]",
 		Short: "Allow an operation (host + method + path [+ query/body/response contract])",
-		Args:  cobra.NoArgs,
+		Long: "Saving a host that already has a rule UPDATES it: the api replaces the whole rule, so\n" +
+			"this command reads the existing one first and keeps every field you do not pass\n" +
+			"(query keys, query constraints, response mode/fields, body template, max response size).\n" +
+			"--method and --path are always taken from the flags.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runProxyTargetAdd(cmd, opts)
 		},
@@ -247,9 +254,10 @@ func newSecretProxyTargetCommand(opts Options) *cobra.Command {
 	add.Flags().StringArray("method", nil, "allowed HTTP method(s), e.g. GET (required, repeatable)")
 	add.Flags().StringArray("path", nil, "allowed path prefix(es), e.g. /v1/ (required, repeatable)")
 	add.Flags().StringArray("query", nil, "allowed query key(s) (repeatable)")
-	add.Flags().StringArray("response-field", nil, "JSON field(s) to project back (repeatable)")
+	add.Flags().StringArray("response-field", nil, "dot-path to project back; one \"*\" walks a list, e.g. tree.*.path (max 10,000 items; repeatable)")
 	add.Flags().String("response-mode", "projection", "projection | redacted_body")
 	add.Flags().String("body-template", "", "JSON body template pinning the operation (\"*\"=scalar wildcard)")
+	add.Flags().Int64("max-response-bytes", 0, "cap on the projected response size in bytes (0 = keep existing / default 64 KiB; hard max 1048576)")
 	_ = add.MarkFlagRequired("secret")
 	_ = add.MarkFlagRequired("host")
 	_ = add.MarkFlagRequired("method")
@@ -305,16 +313,51 @@ func runProxyTargetAdd(cmd *cobra.Command, opts Options) error {
 	fields, _ := cmd.Flags().GetStringArray("response-field")
 	mode, _ := cmd.Flags().GetString("response-mode")
 	bodyTemplate, _ := cmd.Flags().GetString("body-template")
+	maxBytes, _ := cmd.Flags().GetInt64("max-response-bytes")
+	if maxBytes < 0 || maxBytes > maxProxyResponseBytes {
+		return fmt.Errorf("--max-response-bytes must be between 0 and %d", maxProxyResponseBytes)
+	}
+	changed := cmd.Flags().Changed
 
 	return withClient(opts, func(api APIClient) error {
 		secretID, err := resolveSecretName(cmd, api, ws, name)
 		if err != nil {
 			return err
 		}
-		saved, err := api.PutProxyTarget(cmd.Context(), ws, secretID, client.ProxyTarget{
+		target := client.ProxyTarget{
 			Host: host, Methods: methods, PathPrefixes: paths, AllowedQuery: query,
 			ResponseMode: mode, ResponseFields: fields, BodyTemplate: bodyTemplate,
-		})
+			MaxResponseBytes: maxBytes,
+		}
+		// PUT replaces the whole rule, so start from the existing one for this host.
+		existing, err := api.ListProxyTargets(cmd.Context(), ws, secretID)
+		if err != nil {
+			return err
+		}
+		for _, e := range existing {
+			if !strings.EqualFold(e.Host, host) {
+				continue
+			}
+			fmt.Fprintf(opts.Err, "updating existing rule for %s (unspecified fields kept)\n", host)
+			target.QueryConstraints = e.QueryConstraints // not editable via flags
+			if !changed("query") {
+				target.AllowedQuery = e.AllowedQuery
+			}
+			if !changed("response-field") {
+				target.ResponseFields = e.ResponseFields
+			}
+			if !changed("response-mode") {
+				target.ResponseMode = e.ResponseMode
+			}
+			if !changed("body-template") {
+				target.BodyTemplate = e.BodyTemplate
+			}
+			if maxBytes == 0 {
+				target.MaxResponseBytes = e.MaxResponseBytes
+			}
+			break
+		}
+		saved, err := api.PutProxyTarget(cmd.Context(), ws, secretID, target)
 		if err != nil {
 			return err
 		}
