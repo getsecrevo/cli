@@ -134,6 +134,8 @@ func (f fakeAPIClient) SetAgentRead(context.Context, string, string, bool) error
 // secrets is the fixture; everything else accumulates in the call log.
 type secretWritingFake struct {
 	existing    []client.Secret
+	targets     []client.ProxyTarget
+	putTargets  []client.ProxyTarget
 	createCalls []client.SecretCreateRequest
 	rotateCalls []rotateCall
 	updateCalls []updateCall
@@ -230,9 +232,10 @@ func (f *secretWritingFake) CloseProxySession(context.Context, string, string) e
 	return errors.New("secretWritingFake does not support CloseProxySession")
 }
 func (f *secretWritingFake) ListProxyTargets(context.Context, string, string) ([]client.ProxyTarget, error) {
-	return nil, nil
+	return f.targets, nil
 }
 func (f *secretWritingFake) PutProxyTarget(_ context.Context, _ string, _ string, t client.ProxyTarget) (client.ProxyTarget, error) {
+	f.putTargets = append(f.putTargets, t)
 	return t, nil
 }
 func (f *secretWritingFake) DeleteProxyTarget(context.Context, string, string, string) error {
@@ -1668,5 +1671,89 @@ func TestSecretRevealRejectsJSONWithToFile(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "--json applies only to --allow-stdout") {
 		t.Fatalf("Execute() error = %v, want --json/--to-file conflict error", err)
+	}
+}
+
+func runProxyTargetAddTest(t *testing.T, fake *secretWritingFake, extra ...string) (*client.ProxyTarget, string) {
+	t.Helper()
+	var errOut bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &errOut,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	args := append([]string{"secret", "proxy-target", "add", "--secret", "GH", "--host", "api.github.com",
+		"--method", "GET", "--path", "/repos/"}, extra...)
+	cmd.SetArgs(args)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(fake.putTargets) != 1 {
+		t.Fatalf("put calls = %d, want 1", len(fake.putTargets))
+	}
+	return &fake.putTargets[0], errOut.String()
+}
+
+func proxyTargetFake(existing ...client.ProxyTarget) *secretWritingFake {
+	return &secretWritingFake{
+		existing: []client.Secret{{WorkspaceID: "workspace-1", SecretID: "secret-1", Name: "GH", Status: "active"}},
+		targets:  existing,
+	}
+}
+
+func TestProxyTargetAddPreservesExistingFields(t *testing.T) {
+	fake := proxyTargetFake(client.ProxyTarget{
+		Host: "api.github.com", Methods: []string{"GET"}, PathPrefixes: []string{"/old/"},
+		AllowedQuery: []string{"recursive"}, QueryConstraints: map[string]string{"per_page": "100"},
+		BodyTemplate: `{"a":"*"}`, ResponseMode: "redacted_body", ResponseFields: []string{"tree.*.path"},
+		MaxResponseBytes: 524288,
+	})
+	got, errOut := runProxyTargetAddTest(t, fake)
+	if got.MaxResponseBytes != 524288 || got.QueryConstraints["per_page"] != "100" ||
+		got.BodyTemplate != `{"a":"*"}` || got.ResponseMode != "redacted_body" ||
+		len(got.ResponseFields) != 1 || len(got.AllowedQuery) != 1 {
+		t.Fatalf("existing fields not preserved: %+v", got)
+	}
+	if got.PathPrefixes[0] != "/repos/" {
+		t.Fatalf("path not taken from flags: %+v", got.PathPrefixes)
+	}
+	if !strings.Contains(errOut, "updating existing rule for api.github.com (unspecified fields kept)") {
+		t.Fatalf("notice missing: %q", errOut)
+	}
+}
+
+func TestProxyTargetAddOverridesPassedFields(t *testing.T) {
+	fake := proxyTargetFake(client.ProxyTarget{
+		Host: "api.github.com", AllowedQuery: []string{"recursive"}, ResponseFields: []string{"a"},
+		ResponseMode: "redacted_body", MaxResponseBytes: 524288,
+	})
+	got, _ := runProxyTargetAddTest(t, fake, "--response-field", "tree.*.path", "--response-mode", "projection",
+		"--query", "ref", "--max-response-bytes", "1048576")
+	if got.MaxResponseBytes != 1048576 || got.ResponseMode != "projection" ||
+		got.ResponseFields[0] != "tree.*.path" || got.AllowedQuery[0] != "ref" {
+		t.Fatalf("passed fields not applied: %+v", got)
+	}
+}
+
+func TestProxyTargetAddNewHostNoNotice(t *testing.T) {
+	fake := proxyTargetFake()
+	got, errOut := runProxyTargetAddTest(t, fake, "--max-response-bytes", "2048")
+	if got.MaxResponseBytes != 2048 || got.ResponseMode != "projection" || errOut != "" {
+		t.Fatalf("unexpected: %+v notice=%q", got, errOut)
+	}
+}
+
+func TestProxyTargetAddRejectsOversizeMax(t *testing.T) {
+	cmd := NewRootCommand(Options{
+		WorkspaceID:   "workspace-1",
+		Out:           &bytes.Buffer{},
+		Err:           &bytes.Buffer{},
+		ClientFactory: func() (APIClient, error) { return proxyTargetFake(), nil },
+	})
+	cmd.SetArgs([]string{"secret", "proxy-target", "add", "--secret", "GH", "--host", "h", "--method", "GET",
+		"--path", "/", "--max-response-bytes", "1048577"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("want error for > 1 MiB")
 	}
 }
