@@ -281,6 +281,7 @@ func newSecretCommand(opts Options) *cobra.Command {
 	secret.AddCommand(newSecretProxyTargetCommand(opts))
 	secret.AddCommand(newSecretCredScopeCommand(opts))
 	secret.AddCommand(newSecretAgentReadCommand(opts))
+	secret.AddCommand(newSecretRequestCommand(opts))
 	return secret
 }
 
