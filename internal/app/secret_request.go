@@ -42,9 +42,9 @@ func newSecretRequestCommand(opts Options) *cobra.Command {
 			"it by email or chat. Nobody, including you, reads the value through the link.\n" +
 			"Works with a human login or an agent token. An agent sends it on its owner's\n" +
 			"behalf (the email says which agent), must name the recipient, never gets the\n" +
-			"link back, and never decides a risky case: when the recipient is not a known\n" +
-			"contact of the secret, or the secret holds a value nobody outside provided, the\n" +
-			"request waits for the owner's approval in the dashboard (status pending_approval).\n\n" +
+			"link back, and never decides a risky case: its request goes out on its own only\n" +
+			"to the person who already provided this secret; a first contact or a different\n" +
+			"person waits for the owner's approval in the dashboard (status pending_approval).\n\n" +
 			"Safety rails enforced by the server:\n" +
 			"  - --secret must be the EXACT name (no fuzzy match).\n" +
 			"  - Replacing a value that may already exist needs --replace (no history is kept).\n" +
