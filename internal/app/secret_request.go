@@ -40,13 +40,16 @@ func newSecretRequestCommand(opts Options) *cobra.Command {
 		Long: "Email a customer, vendor or contractor a single-use, WRITE-ONLY link to enter\n" +
 			"(or rotate) one secret's value straight into the vault, instead of them sending\n" +
 			"it by email or chat. Nobody, including you, reads the value through the link.\n" +
-			"Works with a human login or an agent token: an agent sends it on its owner's\n" +
-			"behalf, and the email says which agent sent it.\n\n" +
+			"Works with a human login or an agent token. An agent sends it on its owner's\n" +
+			"behalf (the email says which agent), must name the recipient, never gets the\n" +
+			"link back, and never decides a risky case: when the recipient is not a known\n" +
+			"contact of the secret, or the secret holds a value nobody outside provided, the\n" +
+			"request waits for the owner's approval in the dashboard (status pending_approval).\n\n" +
 			"Safety rails enforced by the server:\n" +
 			"  - --secret must be the EXACT name (no fuzzy match).\n" +
 			"  - Replacing a value that may already exist needs --replace (no history is kept).\n" +
-			"  - Once a secret has known contacts, emailing someone else is refused until you\n" +
-			"    pass --confirm-new-recipient. Agents: only after the user confirmed it.",
+			"  - For a person, emailing someone who is not a known contact of the secret is\n" +
+			"    refused until you pass --confirm-new-recipient (ignored for agents).",
 	}
 
 	send := &cobra.Command{
@@ -64,7 +67,7 @@ func newSecretRequestCommand(opts Options) *cobra.Command {
 	send.Flags().String("to", "", "recipient email; required unless --no-email")
 	send.Flags().String("message", "", "short plain-text note for the recipient (no links or email addresses)")
 	send.Flags().Bool("replace", false, "the link overwrites the current value (rotation); Secrevo keeps no history")
-	send.Flags().Bool("confirm-new-recipient", false, "confirm the recipient is the new contact for this secret")
+	send.Flags().Bool("confirm-new-recipient", false, "confirm the recipient is the new contact for this secret (people only; an agent's request waits for approval instead)")
 	send.Flags().Int("expires-in-hours", 0, "link lifetime in hours, 1-720 (default 168)")
 	send.Flags().StringArray("label", nil, "friendly label as FIELD=Label (use value=Label for a single-value secret); repeatable")
 	send.Flags().Bool("no-email", false, "do not email anyone; print the link so you can hand it over")
@@ -151,15 +154,23 @@ func runSecretRequestSend(cmd *cobra.Command, opts Options) error {
 		}
 		out := map[string]any{
 			"request_id":              created.Request.ID,
+			"status":                  created.Request.Status,
 			"secret":                  created.Request.SecretName,
 			"recipient_email":         created.Request.RecipientEmail,
 			"email_sent":              created.EmailSent,
 			"expires_at":              created.Request.ExpiresAt,
 			"replaces_existing_value": replace,
 		}
+		if created.Request.ApprovalReason != "" {
+			out["approval_reason"] = created.Request.ApprovalReason
+		}
+		if created.NextStep != "" {
+			out["next_step"] = created.NextStep
+		}
 		// The link is a write capability: print it only when nobody was
-		// emailed and the caller has to deliver it.
-		if !created.EmailSent {
+		// emailed and the caller has to deliver it (the api never returns it
+		// to an agent).
+		if !created.EmailSent && created.URL != "" {
 			out["link"] = created.URL
 		}
 		return writeJSON(opts.Out, out)

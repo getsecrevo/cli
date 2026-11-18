@@ -31,6 +31,7 @@ type SecretRequest struct {
 	Message            string               `json:"message,omitempty"`
 	Fields             []SecretRequestField `json:"fields"`
 	Status             string               `json:"status"`
+	ApprovalReason     string               `json:"approval_reason,omitempty"`
 	ExpiresAt          string               `json:"expires_at"`
 	CreatedAt          string               `json:"created_at"`
 	FulfilledAt        string               `json:"fulfilled_at,omitempty"`
@@ -51,8 +52,10 @@ type SecretRequestCreateRequest struct {
 // SecretRequestCreated is the api's answer: the request plus the link, shown once.
 type SecretRequestCreated struct {
 	Request   SecretRequest `json:"request"`
-	URL       string        `json:"url"`
+	URL       string        `json:"url,omitempty"`
 	EmailSent bool          `json:"email_sent"`
+	// NextStep is set for agent callers when the request waits for a person.
+	NextStep string `json:"next_step,omitempty"`
 }
 
 // CreateSecretRequestByName creates a request for the secret with EXACTLY this

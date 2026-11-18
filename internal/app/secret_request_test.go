@@ -86,6 +86,42 @@ func TestSecretRequestSendNoEmailPrintsLink(t *testing.T) {
 	}
 }
 
+// pendingApprovalFake answers like the api does for an agent whose request
+// needs the owner's decision: 202, no link, no email.
+type pendingApprovalFake struct{ secretRequestFake }
+
+func (f *pendingApprovalFake) CreateSecretRequestByName(_ context.Context, ws, name string, req client.SecretRequestCreateRequest) (client.SecretRequestCreated, error) {
+	f.gotWS, f.gotName, f.gotReq = ws, name, req
+	return client.SecretRequestCreated{
+		Request: client.SecretRequest{ID: "sr_2", SecretName: name, RecipientEmail: req.RecipientEmail, Status: "pending_approval",
+			ApprovalReason: "x@else.com has never provided this secret"},
+		NextStep: "Nothing was sent yet. The owner has to approve it.",
+	}, nil
+}
+
+func TestSecretRequestSendPendingApproval(t *testing.T) {
+	fake := &pendingApprovalFake{}
+	var out bytes.Buffer
+	cmd := NewRootCommand(Options{
+		WorkspaceID: "workspace-1", Out: &out, Err: &out,
+		ClientFactory: func() (APIClient, error) { return fake, nil },
+	})
+	cmd.SetArgs([]string{"secret", "request", "send", "--secret", "ERP", "--to", "x@else.com", "--replace"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() = %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("output is not JSON: %s", out.String())
+	}
+	if got["status"] != "pending_approval" || got["next_step"] == nil || got["approval_reason"] == nil {
+		t.Fatalf("output = %s", out.String())
+	}
+	if _, has := got["link"]; has {
+		t.Fatalf("no link may be printed for a held request: %s", out.String())
+	}
+}
+
 func TestSecretRequestSendNeedsRecipientOrNoEmail(t *testing.T) {
 	fake := &secretRequestFake{}
 	if _, err := runSR(t, fake, "secret", "request", "send", "--secret", "DB_PROD"); err == nil || !strings.Contains(err.Error(), "--to is required") {
